@@ -146,8 +146,8 @@ ROOT_URLCONF = 'crud.urls'
 
 WSGI_APPLICATION = 'crud.wsgi.application'
 
-GOOGLE_API_KEY=os.getenv("AIzaSyDEO09Xsqre5_b3wM5tSk5nagRGF5ScJAM")
-
+GOOGLE_API_KEY=os.getenv("AIzaSyAv2zX0Jnfr5Oq4p8V-RLX3qVfVZ0EHOvo")
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 DATABASE_URL = f"postgresql://{os.getenv('DB_USER', 'postgres')}:{os.getenv('DB_PASSWORD', 'root')}@{os.getenv('DB_HOST', 'localhost')}:{os.getenv('DB_PORT', '5432')}/{os.getenv('DB_NAME', 'data_analysis')}"
 
 REST_FRAMEWORK = {

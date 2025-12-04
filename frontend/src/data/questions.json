@@ -1,0 +1,72 @@
+[
+  {
+    "id": 1,
+    "category": "Sales Analysis",
+    "question": "Show me the total sales by region",
+    "description": "Get a breakdown of sales performance across different regions",
+    "icon": "📊"
+  },
+  {
+    "id": 2,
+    "category": "Customer Insights",
+    "question": "What are the top 10 customers by revenue?",
+    "description": "Identify your most valuable customers",
+    "icon": "👥"
+  },
+  {
+    "id": 3,
+    "category": "Product Performance",
+    "question": "Which products have the highest profit margin?",
+    "description": "Analyze product profitability",
+    "icon": "📦"
+  },
+  {
+    "id": 4,
+    "category": "Time Series",
+    "question": "Show monthly sales trends for the last year",
+    "description": "Track sales performance over time",
+    "icon": "📈"
+  },
+  {
+    "id": 5,
+    "category": "Inventory",
+    "question": "What items are running low on stock?",
+    "description": "Monitor inventory levels",
+    "icon": "📋"
+  },
+  {
+    "id": 6,
+    "category": "Financial",
+    "question": "Calculate the average order value",
+    "description": "Understand customer spending patterns",
+    "icon": "💰"
+  },
+  {
+    "id": 7,
+    "category": "Marketing",
+    "question": "Which marketing channels drive the most conversions?",
+    "description": "Analyze marketing effectiveness",
+    "icon": "📢"
+  },
+  {
+    "id": 8,
+    "category": "Operations",
+    "question": "What is the average delivery time by shipping method?",
+    "description": "Optimize delivery performance",
+    "icon": "🚚"
+  },
+  {
+    "id": 9,
+    "category": "Quality",
+    "question": "Show customer satisfaction ratings by product category",
+    "description": "Monitor product quality and satisfaction",
+    "icon": "⭐"
+  },
+  {
+    "id": 10,
+    "category": "Growth",
+    "question": "Identify emerging trends in customer behavior",
+    "description": "Discover new business opportunities",
+    "icon": "🚀"
+  }
+]

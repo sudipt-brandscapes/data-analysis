@@ -1,198 +1,570 @@
-# backend/app/views.py
-from venv import logger
+# backend/app/views.py - COMPLETE UPDATED VERSION
 from rest_framework.views import APIView
-from django.conf import settings
-
-
 from rest_framework.response import Response
 from rest_framework import status
-from rest_framework.parsers import MultiPartParser, FormParser
-from django.conf import settings
-
-from langchain.prompts import PromptTemplate
-import os
-import pandas as pd
-from langchain_google_genai import ChatGoogleGenerativeAI
-import pandas as pd
-from dotenv import load_dotenv
-import re
-import io
-from sqlalchemy import create_engine, text
-from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
-import logging
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
-
-from io import StringIO
+from django.conf import settings
 from django.http import HttpResponse
 
+from langchain_core.prompts import PromptTemplate
+from langchain_openai import ChatOpenAI
+from langchain_community.utilities import SQLDatabase
+from langchain_community.agent_toolkits.sql.toolkit import SQLDatabaseToolkit
+from langgraph.prebuilt import create_react_agent
+
+import os
+import pandas as pd
+import re
+import io
+from io import StringIO
+import time
+from collections import deque
+import numpy as np
+from typing import Dict, Any, List
+from sqlalchemy import create_engine, text
+import logging
 
 logger = logging.getLogger(__name__)
 
+# Import models for chat history
+from .models import ChatHistory, UploadedFile
 
+# --- Rate Limiter ---
+class RateLimiter:
+    """Rate limiter using sliding window"""
+    def __init__(self, max_requests=8, time_window=60):
+        self.max_requests = max_requests
+        self.time_window = time_window
+        self.requests = deque()
+    
+    def can_proceed(self):
+        current_time = time.time()
+        while self.requests and self.requests[0] < current_time - self.time_window:
+            self.requests.popleft()
+        if len(self.requests) < self.max_requests:
+            self.requests.append(current_time)
+            return True
+        return False
+    
+    def wait_time(self):
+        if not self.requests:
+            return 0
+        current_time = time.time()
+        oldest_request = self.requests[0]
+        time_passed = current_time - oldest_request
+        if time_passed >= self.time_window:
+            return 0
+        return self.time_window - time_passed
+    
+    def wait_if_needed(self):
+        if not self.can_proceed():
+            wait_seconds = self.wait_time()
+            logger.warning(f"Rate limit reached. Waiting {wait_seconds:.1f} seconds...")
+            time.sleep(wait_seconds + 0.1)
+            self.requests.append(time.time())
 
+gemini_rate_limiter = RateLimiter(max_requests=8, time_window=60)
 
-def get_api_key():
-    """Get Google API key from Django settings or environment"""
-    try:
-        # First try Django settings
-        api_key = settings.GOOGLE_API_KEY
-        if not api_key:
-            raise AttributeError
-        return api_key
-    except AttributeError:
-        # Then try environment variable
-        load_dotenv()
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            raise Exception("Google API key not found. Please set GOOGLE_API_KEY in settings.py or .env file")
-        return api_key
+# --- Chart Generator ---
+class ChartDataGenerator:
+    """Generate chart-ready data from DataFrame"""
+    @staticmethod
+    def prepare_chart_data(df: pd.DataFrame, chart_config: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            chart_type = chart_config["type"]
+            if chart_type == "bar":
+                return ChartDataGenerator._prepare_bar_data(df, chart_config)
+            elif chart_type == "line":
+                return ChartDataGenerator._prepare_line_data(df, chart_config)
+            elif chart_type == "pie":
+                return ChartDataGenerator._prepare_pie_data(df, chart_config)
+            elif chart_type == "scatter":
+                return ChartDataGenerator._prepare_scatter_data(df, chart_config)
+            else:
+                return ChartDataGenerator._prepare_bar_data(df, chart_config)
+        except Exception as e:
+            logger.error(f"Error preparing chart data: {str(e)}")
+            return {"labels": [], "datasets": [], "error": str(e)}
+    
+    @staticmethod
+    def _prepare_bar_data(df: pd.DataFrame, config: Dict) -> Dict:
+        x_col = config.get("x_column")
+        y_col = config.get("y_column")
+        aggregation = config.get("aggregation", "sum")
+        limit = config.get("data_config", {}).get("limit", 20)
+        
+        if not x_col or not y_col:
+            return {"labels": [], "datasets": []}
+        
+        if aggregation == "count":
+            grouped = df.groupby(x_col).size().reset_index(name=y_col)
+        elif aggregation == "sum":
+            grouped = df.groupby(x_col)[y_col].sum().reset_index()
+        elif aggregation == "avg":
+            grouped = df.groupby(x_col)[y_col].mean().reset_index()
+        else:
+            grouped = df[[x_col, y_col]].copy()
+        
+        grouped = grouped.nlargest(limit, y_col)
+        grouped = grouped.replace([np.inf, -np.inf], np.nan).dropna()
+        colors = ChartDataGenerator._generate_colors(len(grouped))
+        
+        return {
+            "labels": grouped[x_col].astype(str).tolist(),
+            "datasets": [{
+                "label": y_col,
+                "data": grouped[y_col].tolist(),
+                "backgroundColor": colors,
+                "borderColor": [c.replace('0.8', '1') for c in colors],
+                "borderWidth": 2
+            }]
+        }
+    
+    @staticmethod
+    def _prepare_line_data(df: pd.DataFrame, config: Dict) -> Dict:
+        x_col = config.get("x_column")
+        y_col = config.get("y_column")
+        limit = config.get("data_config", {}).get("limit", 50)
+        
+        if not x_col or not y_col:
+            return {"labels": [], "datasets": []}
+        
+        sorted_df = df[[x_col, y_col]].sort_values(x_col).head(limit)
+        sorted_df = sorted_df.replace([np.inf, -np.inf], np.nan).dropna()
+        
+        return {
+            "labels": sorted_df[x_col].astype(str).tolist(),
+            "datasets": [{
+                "label": y_col,
+                "data": sorted_df[y_col].tolist(),
+                "borderColor": "rgba(16, 185, 129, 1)",
+                "backgroundColor": "rgba(16, 185, 129, 0.1)",
+                "tension": 0.4,
+                "fill": False,
+                "borderWidth": 3
+            }]
+        }
+    
+    @staticmethod
+    def _prepare_pie_data(df: pd.DataFrame, config: Dict) -> Dict:
+        x_col = config.get("x_column")
+        y_col = config.get("y_column")
+        limit = config.get("data_config", {}).get("limit", 10)
+        
+        if not x_col or not y_col:
+            return {"labels": [], "datasets": []}
+        
+        grouped = df.groupby(x_col)[y_col].sum().reset_index()
+        grouped = grouped.nlargest(limit, y_col)
+        grouped = grouped.replace([np.inf, -np.inf], np.nan).dropna()
+        colors = ChartDataGenerator._generate_colors(len(grouped))
+        
+        return {
+            "labels": grouped[x_col].astype(str).tolist(),
+            "datasets": [{
+                "data": grouped[y_col].tolist(),
+                "backgroundColor": colors,
+                "borderWidth": 2,
+                "borderColor": "#1a1a1a"
+            }]
+        }
+    
+    @staticmethod
+    def _prepare_scatter_data(df: pd.DataFrame, config: Dict) -> Dict:
+        x_col = config.get("x_column")
+        y_col = config.get("y_column")
+        limit = config.get("data_config", {}).get("limit", 100)
+        
+        if not x_col or not y_col:
+            return {"datasets": []}
+        
+        sample_df = df[[x_col, y_col]].head(limit)
+        sample_df = sample_df.replace([np.inf, -np.inf], np.nan).dropna()
+        scatter_data = [
+            {"x": float(row[x_col]), "y": float(row[y_col])}
+            for _, row in sample_df.iterrows()
+        ]
+        
+        return {
+            "datasets": [{
+                "label": f"{y_col} vs {x_col}",
+                "data": scatter_data,
+                "backgroundColor": "rgba(236, 72, 153, 0.6)",
+                "borderColor": "rgba(236, 72, 153, 1)",
+                "pointRadius": 6
+            }]
+        }
+    
+    @staticmethod
+    def _generate_colors(count: int) -> List[str]:
+        base_colors = [
+            "rgba(239, 68, 68, 0.8)", "rgba(251, 146, 60, 0.8)", "rgba(245, 158, 11, 0.8)",
+            "rgba(234, 179, 8, 0.8)", "rgba(132, 204, 22, 0.8)", "rgba(34, 197, 94, 0.8)",
+            "rgba(16, 185, 129, 0.8)", "rgba(20, 184, 166, 0.8)", "rgba(6, 182, 212, 0.8)",
+            "rgba(14, 165, 233, 0.8)", "rgba(59, 130, 246, 0.8)", "rgba(99, 102, 241, 0.8)",
+            "rgba(139, 92, 246, 0.8)", "rgba(168, 85, 247, 0.8)", "rgba(217, 70, 239, 0.8)",
+            "rgba(236, 72, 153, 0.8)", "rgba(244, 63, 94, 0.8)"
+        ]
+        return [base_colors[i % len(base_colors)] for i in range(count)]
 
-def setup_llm():
-    """Initialize Gemini and chain with dynamic schema"""
-    try:
-        api_key = get_api_key()
-        llm = ChatGoogleGenerativeAI(
-            model="gemini-1.5-flash",
-            temperature=0,
-            google_api_key=api_key,
-            convert_system_message_to_human=True
-        )
-        prompt = get_prompt_template()
-        return prompt, llm
-    except Exception as e:
-        raise Exception(f"Error setting up LLM: {str(e)}")
-
-
-def get_prompt_template():
-    """Get the prompt template with dynamic schema"""
-    template = """
-You are an expert SQL query generator for a dynamic database. Given a natural language question, generate the appropriate SQL query based on the following schema:
-
-DATABASE SCHEMA:
-{schema}
-
-IMPORTANT RULES FOR SQL QUERY GENERATION:
-1. Return ONLY the SQL query without explanations or comments.
-2. Use appropriate JOIN clauses for combining tables.
-3. If tables have columns with the same name, use aliases for each table.
-4. If two columns are identical across tables, merge them into a single column by selecting only one.
-5. Use relevant WHERE clauses for filtering and specify join conditions clearly.
-6. Include aggregation functions (COUNT, AVG, SUM) when required.
-7. Use GROUP BY for aggregated results and ORDER BY for sorting when applicable.
-8. Select only needed columns instead of using *.
-9. Always limit results to 10 rows unless asked otherwise.
-10. Clearly assign aliases to each table and reference all columns with table aliases.
-11. Always check the table schema and column names to ensure correct references.
-12. For age calculations use: CAST(CAST(JULIANDAY(CURRENT_TIMESTAMP) - JULIANDAY(CAST(birth_year AS TEXT) || '-01-01') AS INT) / 365 AS INT)
-13. Ensure foreign key relationships are correctly used in JOINs.
-14. Use aggregation functions with actual columns from the correct table.
-15. Use table aliases, but **do not use the 'AS' keyword for aliases** (e.g., `uploaded_data ud` instead of `uploaded_data AS ud`).
-16. The SQL query should be able to run in SQLite.
-17. most Don't use this format  ```sql ```  only give me the sql query.
-18. IMPORTANT: When referencing column names that contain spaces or special characters, always wrap them in double quotes ("). For example: "Hair serums", "Product category"
-19. For column names with spaces, use double quotes like this: SELECT "Hair serums" FROM table_name
-
-User Question: {question}
-
-Generate the SQL query that answers this question:
-"""
-    return PromptTemplate(
-        input_variables=["question", "schema"],
-        template=template
-    )
-
-
-def generate_result_explanation(results_df, user_question, llm):
-    """Generate a clear, concise explanation of query results with key insights."""
-    try:
-        # Basic dataset info
-        row_count = len(results_df)
-        if row_count == 0:
-            return "###No Results Found\nThe query returned no data. Please try modifying your search criteria."
-
-        # Analyze numeric and categorical columns
-        insights = []
-        for column in results_df.columns:
-            col_data = results_df[column]
+# --- Visualization Agent ---
+class OptimizedVisualizationAgent:
+    """Rule-based visualization agent"""
+    def __init__(self, api_key: str = None):
+        self.api_key = api_key
+    
+    def analyze(self, df: pd.DataFrame, question: str = "") -> Dict[str, Any]:
+        try:
+            summary = self._analyze_data(df)
+            charts = self._recommend_charts_rule_based(df, summary, question)
+            insights = self._generate_insights_rule_based(df, summary, question)
+            
+            return {
+                "success": True,
+                "summary": summary,
+                "charts": charts,
+                "insights": insights,
+                "error": ""
+            }
+        except Exception as e:
+            logger.error(f"Error in visualization analysis: {str(e)}")
+            return {"success": False, "error": str(e), "summary": {}, "charts": [], "insights": ""}
+    
+    def _analyze_data(self, df: pd.DataFrame) -> Dict[str, Any]:
+        summary = {
+            "row_count": len(df),
+            "column_count": len(df.columns),
+            "columns": {},
+            "numeric_columns": [],
+            "categorical_columns": []
+        }
+        
+        for col in df.columns:
+            col_data = df[col]
+            col_info = {"name": col, "dtype": str(col_data.dtype), "unique_count": int(col_data.nunique())}
             
             if pd.api.types.is_numeric_dtype(col_data):
-                # Only calculate stats if there's non-null numeric data
+                summary["numeric_columns"].append(col)
                 if not col_data.isna().all():
-                    stats = {
-                        'mean': col_data.mean(),
-                        'max': col_data.max(),
-                        'min': col_data.min()
-                    }
-                    insights.append(f"- {column}: Range {stats['min']:.2f} to {stats['max']:.2f}, Average {stats['mean']:.2f}")
+                    col_info.update({"min": float(col_data.min()), "max": float(col_data.max())})
             else:
-                # For categorical columns, show top values and their counts
-                value_counts = col_data.value_counts().head(3)
-                if not value_counts.empty:
-                    top_values = ", ".join(f"{val} ({count})" for val, count in value_counts.items())
-                    insights.append(f"- {column}: Most common values: {top_values}")
-
-        # Create analysis prompt
-        analysis_prompt = f"""
-        Analyze this data summary for the question: "{user_question}"
+                summary["categorical_columns"].append(col)
+            
+            summary["columns"][col] = col_info
         
-        Dataset Overview:
-        - Total records: {row_count}
-        - Column insights:
-        {chr(10).join(insights)}
+        return summary
+    
+    def _recommend_charts_rule_based(self, df: pd.DataFrame, summary: Dict, question: str) -> List[Dict]:
+        charts = []
+        numeric_cols = summary["numeric_columns"]
+        categorical_cols = summary["categorical_columns"]
+        question_lower = question.lower()
         
-        First few rows:
-        {results_df.head(2).to_string()}
+        # Only generate 1 most relevant chart
+        if categorical_cols and numeric_cols:
+            cat_col = categorical_cols[0]
+            num_col = numeric_cols[0]
+            unique_count = summary["columns"][cat_col]["unique_count"]
+            
+            if unique_count <= 15:
+                charts.append({
+                    "type": "bar",
+                    "x_column": cat_col,
+                    "y_column": num_col,
+                    "title": f"{num_col} by {cat_col}",
+                    "description": f"Comparison of {num_col} across {cat_col}",
+                    "priority": 1,
+                    "aggregation": "sum",
+                    "data_config": {"limit": 15}
+                })
         
-        Provide a 2-3 sentence summary that:
-        1. Directly answers the user's question
-        2. Highlights the most significant findings
-        3. Mentions any notable patterns or trends
-        """
-
-        # Get explanation from LLM
-        response = llm.invoke(analysis_prompt)
-        explanation = response.content if hasattr(response, 'content') else str(response)
+        return charts[:1]
+    
+    def _generate_insights_rule_based(self, df: pd.DataFrame, summary: Dict, question: str) -> str:
+        insights = []
+        insights.append(f"Dataset contains {summary['row_count']:,} records across {summary['column_count']} columns")
         
-        # Format the final output
-        formatted_explanation = f"""
-
-{explanation}
-
-- Records analyzed: {row_count:,}
-- Columns analyzed: {len(results_df.columns)}"""
+        if summary['numeric_columns'] and summary['categorical_columns']:
+            insights.append(f"Mix of {len(summary['numeric_columns'])} numeric and {len(summary['categorical_columns'])} categorical fields")
         
-        return formatted_explanation
+        if summary['categorical_columns']:
+            cat_col = summary['categorical_columns'][0]
+            unique_count = summary['columns'][cat_col]['unique_count']
+            insights.append(f"{cat_col} has {unique_count} distinct categories")
+        
+        return "\n".join([f"{i+1}. {insight}" for i, insight in enumerate(insights[:3])])
 
+VisualizationAgent = OptimizedVisualizationAgent
+
+# --- SQL ReAct Agent ---
+class OptimizedSQLReActAgent:
+    """SQL ReAct Agent with uploads schema isolation"""
+    def __init__(self, db_uri: str, api_key: str):
+        try:
+            self.db_uri = db_uri
+            
+            # CRITICAL: Only see uploads schema
+            self.db = SQLDatabase.from_uri(
+                db_uri,
+                schema="uploads",
+                include_tables=None,
+                sample_rows_in_table_info=3
+            )
+            
+            self.llm = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0,
+    openai_api_key=api_key,
+    timeout=15,
+    max_retries=1
+)
+            
+            self.toolkit = SQLDatabaseToolkit(db=self.db, llm=self.llm)
+            tools = self.toolkit.get_tools()
+            self.agent = create_react_agent(self.llm, tools)
+            
+            logger.info("SQL ReAct Agent initialized (uploads schema only)")
+        except Exception as e:
+            logger.error(f"Error initializing SQL ReAct Agent: {str(e)}")
+            raise
+    
+    def query(self, question: str) -> dict:
+        try:
+            gemini_rate_limiter.wait_if_needed()
+            schema_info = self._get_schema_fast()
+            
+            prompt = f"""Generate a SIMPLE PostgreSQL query to answer this question.
+
+DATABASE SCHEMA (uploads schema only):
+{schema_info}
+
+CRITICAL RULES:
+1. Return ONLY the SQL query, no explanations
+2. ALL table names MUST use 'uploads.' prefix (e.g., uploads.sales_data)
+3. Use double quotes for column names with spaces
+4. ALWAYS add LIMIT 100
+5. Keep it SIMPLE
+
+QUESTION: {question}
+
+Generate query:"""
+
+            response = self.llm.invoke(prompt)
+            sql_query = response.content.strip()
+            sql_query = sql_query.replace('```sql', '').replace('```', '').strip()
+            
+            if not sql_query or 'SELECT' not in sql_query.upper():
+                return {
+                    "success": False,
+                    "error": "Could not generate a valid SQL query.",
+                    "results": pd.DataFrame(),
+                    "query": "",
+                    "explanation": ""
+                }
+            
+            # Security check
+            if self._is_query_unsafe(sql_query):
+                return {
+                    "success": False,
+                    "error": "Cannot query system tables. Only uploaded data can be queried.",
+                    "results": pd.DataFrame(),
+                    "query": sql_query,
+                    "explanation": ""
+                }
+            
+            results = self._execute_query(sql_query)
+            
+            if results is None:
+                gemini_rate_limiter.wait_if_needed()
+                corrected_query = self._fix_query_fast(sql_query, question, schema_info)
+                if corrected_query and not self._is_query_unsafe(corrected_query):
+                    results = self._execute_query(corrected_query)
+                    if results is not None:
+                        sql_query = corrected_query
+                
+                if results is None:
+                    return {
+                        "success": False,
+                        "error": "Query execution failed. Please rephrase your question.",
+                        "results": pd.DataFrame(),
+                        "query": sql_query,
+                        "explanation": ""
+                    }
+            
+            if results.empty:
+                return {
+                    "success": True,
+                    "results": pd.DataFrame(),
+                    "query": sql_query,
+                    "explanation": "No results found for your query.",
+                    "message": "No data matches your criteria."
+                }
+            
+            return {
+                "success": True,
+                "results": results,
+                "query": sql_query,
+                "explanation": f"Query returned {len(results)} records."
+            }
+        except Exception as e:
+            logger.error(f"Error in SQL query: {str(e)}")
+            return {
+                "success": False,
+                "error": f"Error: {str(e)}",
+                "results": pd.DataFrame(),
+                "query": "",
+                "explanation": ""
+            }
+    
+    def _is_query_unsafe(self, query: str) -> bool:
+        """Check if query tries to access forbidden tables/schemas"""
+        query_lower = query.lower()
+        forbidden = ['public.', 'information_schema.', 'chat_history', 'uploaded_files', 'user_preferences']
+        return any(forbidden_item in query_lower for forbidden_item in forbidden)
+    
+    def _execute_query(self, query: str) -> pd.DataFrame:
+        try:
+            engine = create_engine(self.db_uri)
+            with engine.connect() as conn:
+                result = conn.execute(text(query))
+                df = pd.DataFrame(result.fetchall(), columns=result.keys())
+                return df
+        except Exception as e:
+            logger.error(f"Error executing query: {str(e)}")
+            return None
+        finally:
+            if 'engine' in locals():
+                engine.dispose()
+    
+    def _get_schema_fast(self) -> str:
+        try:
+            engine = create_engine(self.db_uri)
+            with engine.connect() as conn:
+                tables_query = """
+                    SELECT table_name 
+                    FROM information_schema.tables 
+                    WHERE table_schema = 'uploads'
+                    LIMIT 10
+                """
+                tables_result = conn.execute(text(tables_query))
+                tables = [row[0] for row in tables_result]
+                
+                if not tables:
+                    return "No uploaded data available. Please upload a file first."
+                
+                schema_str = "AVAILABLE TABLES (uploads schema):\n\n"
+                for table in tables:
+                    columns_query = f"""
+                        SELECT column_name, data_type 
+                        FROM information_schema.columns 
+                        WHERE table_schema = 'uploads'
+                        AND table_name = '{table}'
+                        LIMIT 20
+                    """
+                    columns_result = conn.execute(text(columns_query))
+                    columns = [(row[0], row[1]) for row in columns_result]
+                    
+                    schema_str += f"\nTable: uploads.{table}\n"
+                    for col_name, col_type in columns:
+                        schema_str += f"  - {col_name} ({col_type})\n"
+                
+                return schema_str
+        except Exception as e:
+            logger.error(f"Schema fetch error: {str(e)}")
+            return "Schema unavailable"
+        finally:
+            if 'engine' in locals():
+                engine.dispose()
+    
+    def _fix_query_fast(self, failed_query: str, question: str, schema: str) -> str:
+        try:
+            prompt = f"""Fix this failed query. Make it SIMPLER.
+
+SCHEMA (uploads schema):
+{schema}
+
+FAILED QUERY:
+{failed_query}
+
+QUESTION: {question}
+
+RULES:
+1. ALL tables MUST use 'uploads.' prefix
+2. Keep it SIMPLE
+3. Add LIMIT 100
+
+Return ONLY the fixed query:"""
+
+            response = self.llm.invoke(prompt)
+            fixed_query = response.content.strip()
+            fixed_query = fixed_query.replace('```sql', '').replace('```', '').strip()
+            return fixed_query if 'SELECT' in fixed_query.upper() else None
+        except Exception as e:
+            logger.error(f"Query fix error: {str(e)}")
+            return None
+
+# --- Utility Functions ---
+def get_api_key():
+    try:
+        return settings.OPENAI_API_KEY  # Changed from GOOGLE_API_KEY
+    except AttributeError:
+        from dotenv import load_dotenv
+        load_dotenv()
+        api_key = os.getenv("OPENAI_API_KEY")  # Changed from GOOGLE_API_KEY
+        if not api_key:
+            raise Exception("OpenAI API key not found")  # Updated message
+        return api_key
+
+def generate_result_explanation(results_df, user_question, llm):
+    try:
+        row_count = len(results_df)
+        if row_count == 0:
+            return "No results found. The query returned no data."
+        
+        data_summary = f"Query returned {row_count} records with {len(results_df.columns)} columns.\n\n"
+        data_summary += "Columns:\n"
+        for column in results_df.columns:
+            col_data = results_df[column]
+            if pd.api.types.is_numeric_dtype(col_data) and not col_data.isna().all():
+                data_summary += f"- {column}: numeric, range {col_data.min():.2f} to {col_data.max():.2f}\n"
+        
+        data_summary += f"\nSample data:\n{results_df.head(3).to_string()}\n"
+        
+        if llm:
+            try:
+                gemini_rate_limiter.wait_if_needed()
+                prompt = f"""Analyze these query results and provide a clear explanation in 2-3 sentences.
+
+USER QUESTION: {user_question}
+
+DATA SUMMARY:
+{data_summary}
+
+Provide natural language explanation:"""
+
+                response = llm.invoke(prompt)
+                explanation = response.content.strip().replace('```', '').strip()
+                return explanation
+            except Exception:
+                pass
+        
+        return f"Query returned {row_count} record{'s' if row_count > 1 else ''}."
     except Exception as e:
-        return f"""
-        ### ⚠️ Analysis Error
-        
-        Unable to analyze results: {str(e)}
-        
-        Basic Information:
-        - Records: {len(results_df)}
-        - Columns: {', '.join(results_df.columns)}
-        """
-
+        logger.error(f"Error generating explanation: {str(e)}")
+        return f"Query returned {len(results_df)} records."
 
 def clean_column_names(headers):
-    
     cleaned_headers = []
     seen_headers = {}
     
     for header in headers:
-        # Convert to string and clean
         if pd.isna(header) or str(header).strip() == '':
             header = "Unnamed_Column"
         else:
-            # Keep the original header text but clean it for SQL compatibility
             header = str(header).strip()
-            # Replace special characters except spaces
             header = re.sub(r'[^\w\s]', '_', header)
-            # Replace multiple spaces with single underscore
             header = re.sub(r'\s+', '_', header)
-            
-        # Handle duplicate headers
+        
         base_header = header
         counter = 1
         while header in seen_headers:
@@ -205,11 +577,9 @@ def clean_column_names(headers):
     return cleaned_headers
 
 def restructure_excel_sheet(uploaded_file):
-    """Restructure and clean Excel sheet data with enhanced table detection."""
     try:
         file_bytes = uploaded_file.read()
         excel_bytes = io.BytesIO(file_bytes)
-        
         cleaned_dfs = {}
         
         if uploaded_file.name.endswith(('.xlsx', '.xls')):
@@ -230,7 +600,6 @@ def restructure_excel_sheet(uploaded_file):
                     processed_df = process_single_table(df, table_info)
                     if processed_df is not None and not processed_df.empty:
                         table_name = table_info['name'].lower()
-                        print(f"Processing table: {table_name} with {len(processed_df)} rows and {len(processed_df.columns)} columns")
                         cleaned_dfs[table_name] = processed_df
                         
         elif uploaded_file.name.endswith('.csv'):
@@ -246,225 +615,16 @@ def restructure_excel_sheet(uploaded_file):
                     processed_df = process_single_table(df, table_info)
                     if processed_df is not None and not processed_df.empty:
                         table_name = table_info['name'].lower()
-                        print(f"Processing table: {table_name} with {len(processed_df)} rows and {len(processed_df.columns)} columns")
                         cleaned_dfs[table_name] = processed_df
         
         return cleaned_dfs if cleaned_dfs else None
-        
     except Exception as e:
-        print(f"Error processing file: {str(e)}")
+        logger.error(f"Error processing file: {str(e)}")
         return None
     finally:
         uploaded_file.seek(0)
 
-
-def generate_and_execute_query(user_question, schema_str, llm, db_uri):
-    """
-    Generate and execute SQL query for PostgreSQL with improved case-sensitive column handling
-    """
-    try:
-        # Get actual column names and their case from the database
-        engine = create_engine(db_uri)
-        with engine.connect() as connection:
-            # Get all table names first
-            tables_query = """
-                SELECT table_name 
-                FROM information_schema.tables 
-                WHERE table_schema = 'public'
-            """
-            tables_result = connection.execute(text(tables_query))
-            tables = [row[0] for row in tables_result]
-            
-            # Get column information for each table
-            columns_info = {}
-            for table in tables:
-                columns_query = f"""
-                    SELECT column_name 
-                    FROM information_schema.columns 
-                    WHERE table_schema = 'public' 
-                    AND table_name = '{table}'
-                """
-                columns_result = connection.execute(text(columns_query))
-                columns_info[table] = [row[0] for row in columns_result]
-
-        # Add column case information to the schema string
-        schema_str += "\nActual column names and their case:\n"
-        for table, columns in columns_info.items():
-            schema_str += f"\nTable '{table}':\n"
-            for col in columns:
-                schema_str += f"- {col}\n"
-
-        # Generate initial query with explicit column case handling
-        response = llm.invoke(f"""
-        Generate a PostgreSQL-compatible query following these strict rules:
-        1. Use EXACT column names as shown in the schema (case-sensitive)
-        2. Always quote column names with double quotes
-        3. For string comparisons, use ILIKE for case-insensitive matching
-        4. Cast numeric values explicitly using CAST with correct column name case
-        5. Use table name prefix for all columns
-        
-        Schema with exact column names:
-        {schema_str}
-        
-        Question: {user_question}
-        
-        Return only the SQL query without any explanation or markdown formatting.
-        """)
-        
-        sql_query = response.content if hasattr(response, 'content') else str(response)
-        
-        # Clean up the query
-        sql_query = sql_query.strip()
-        if sql_query.startswith('```sql'):
-            sql_query = sql_query[6:-3]
-        sql_query = sql_query.strip()
-        
-        # Execute query
-        try:
-            with engine.connect() as connection:
-                # Test query first
-                test_query = text("EXPLAIN " + sql_query)
-                connection.execute(test_query)
-                
-                # Execute actual query
-                query = text(sql_query)
-                result = connection.execute(query)
-                results = pd.DataFrame(result.fetchall(), columns=result.keys())
-                
-                if results.empty:
-                    # Try to debug with exact column names
-                    debug_response = llm.invoke(f"""
-                    The query returned no results. Modify it using exact column names:
-                    Original query: {sql_query}
-                    
-                    Schema with exact column names:
-                    {schema_str}
-                    
-                    Question: {user_question}
-                    
-                    Return only the fixed SQL query.
-                    """)
-                    
-                    modified_query = debug_response.content.strip()
-                    if modified_query.startswith('```sql'):
-                        modified_query = modified_query[6:-3].strip()
-                    
-                    # Try modified query
-                    query = text(modified_query)
-                    result = connection.execute(query)
-                    results = pd.DataFrame(result.fetchall(), columns=result.keys())
-                    
-                    if not results.empty:
-                        sql_query = modified_query
-                
-                return {
-                    'success': True,
-                    'query': sql_query,
-                    'results': results
-                }
-                
-        except Exception as e:
-            # Attempt to fix the query with correct column names
-            fix_response = llm.invoke(f"""
-            Fix this query using exact column names from the schema.
-            Error: {str(e)}
-            Original query: {sql_query}
-            
-            Schema with exact column names:
-            {schema_str}
-            
-            Return only the fixed SQL query.
-            """)
-            
-            fixed_query = fix_response.content.strip()
-            if fixed_query.startswith('```sql'):
-                fixed_query = fixed_query[6:-3].strip()
-            
-            # Try the fixed query
-            with engine.connect() as connection:
-                query = text(fixed_query)
-                result = connection.execute(query)
-                results = pd.DataFrame(result.fetchall(), columns=result.keys())
-                
-                return {
-                    'success': True,
-                    'query': fixed_query,
-                    'results': results
-                }
-            
-    except Exception as e:
-        return {
-            'success': False,
-            'error': str(e)
-        }
-    finally:
-        if 'engine' in locals():
-            engine.dispose()
-
-def clear_database_tables(engine):
-    """Clear all tables from the data_analysis database"""
-    try:
-        with engine.connect() as conn:
-            # Disable foreign key checks and transactions
-            conn.execute(text("SET session_replication_role = 'replica';"))
-            
-            # Get list of all tables in public schema
-            table_names_query = """
-                SELECT table_name 
-                FROM information_schema.tables 
-                WHERE table_schema = 'public' 
-                AND table_type = 'BASE TABLE';
-            """
-            result = conn.execute(text(table_names_query))
-            tables = [row[0] for row in result]
-            
-            # Drop each table
-            if tables:
-                for table in tables:
-                    conn.execute(text(f'DROP TABLE IF EXISTS "{table}" CASCADE;'))
-                print("Database 'data_analysis' cleared successfully - all existing tables removed.")
-            else:
-                print("Database 'data_analysis' is already empty.")
-                
-            # Re-enable foreign key checks
-            conn.execute(text("SET session_replication_role = 'origin';"))
-            conn.commit()
-            
-    except Exception as e:
-        print(f"Error clearing database: {str(e)}")
-        raise e
-
-def is_table_name_row(row):
-    """Check if a row contains only one non-empty cell that could be a table name."""
-    non_empty_values = row.dropna()
-    return len(non_empty_values) == 1
-
-def is_header_row(row):
-    """Check if a row could be a header row."""
-    non_empty_values = row.dropna()
-    return len(non_empty_values) > 1
-
-def process_single_table(df, table_info):
-    """Process a single table using the provided table information."""
-    try:
-        headers = df.iloc[table_info['header_row']].tolist()
-        cleaned_headers = clean_column_names(headers)
-        
-        start_idx = table_info['data_start']
-        end_idx = table_info['end']
-        data_df = df.iloc[start_idx:end_idx].copy()
-        
-        result_df = pd.DataFrame(data_df.values, columns=cleaned_headers)
-        result_df = result_df.dropna(how='all').dropna(axis=1, how='all')
-        
-        return result_df if not result_df.empty else None
-        
-    except Exception as e:
-        print(f"Error processing table section: {str(e)}")
-        return None
-
 def find_tables_in_dataframe(df, sheet_name="default"):
-    """Find multiple tables in a DataFrame with enhanced detection logic."""
     tables = []
     current_table = None
     i = 0
@@ -543,33 +703,94 @@ def find_tables_in_dataframe(df, sheet_name="default"):
     
     return tables
 
+def is_table_name_row(row):
+    non_empty_values = row.dropna()
+    return len(non_empty_values) == 1
 
+def is_header_row(row):
+    non_empty_values = row.dropna()
+    return len(non_empty_values) > 1
 
+def process_single_table(df, table_info):
+    try:
+        headers = df.iloc[table_info['header_row']].tolist()
+        cleaned_headers = clean_column_names(headers)
+        
+        start_idx = table_info['data_start']
+        end_idx = table_info['end']
+        data_df = df.iloc[start_idx:end_idx].copy()
+        
+        result_df = pd.DataFrame(data_df.values, columns=cleaned_headers)
+        result_df = result_df.dropna(how='all').dropna(axis=1, how='all')
+        
+        return result_df if not result_df.empty else None
+    except Exception as e:
+        logger.error(f"Error processing table: {str(e)}")
+        return None
+
+def sanitize_dataframe_for_json(df):
+    if df is None or df.empty:
+        return df
+    df = df.replace([np.nan, np.inf, -np.inf], None)
+    for col in df.columns:
+        if df[col].dtype in ['float64', 'float32', 'float16']:
+            df[col] = df[col].apply(lambda x: None if (x is not None and (np.isnan(x) or np.isinf(x))) else x)
+    return df
+
+def clear_uploaded_data_tables(engine):
+    """Clear ONLY tables in uploads schema"""
+    try:
+        with engine.connect() as conn:
+            # Create uploads schema if doesn't exist
+            conn.execute(text("CREATE SCHEMA IF NOT EXISTS uploads;"))
+            conn.execute(text("SET session_replication_role = 'replica';"))
+            
+            # Get tables ONLY from uploads schema
+            table_names_query = """
+                SELECT table_name 
+                FROM information_schema.tables 
+                WHERE table_schema = 'uploads' 
+                AND table_type = 'BASE TABLE';
+            """
+            result = conn.execute(text(table_names_query))
+            tables = [row[0] for row in result]
+            
+            # Drop each table in uploads schema
+            for table in tables:
+                conn.execute(text(f'DROP TABLE IF EXISTS uploads."{table}" CASCADE;'))
+            
+            conn.execute(text("SET session_replication_role = 'origin';"))
+            conn.commit()
+            
+            logger.info(f"Cleared {len(tables)} table(s) from uploads schema")
+    except Exception as e:
+        logger.error(f"Error clearing uploads schema: {str(e)}")
+        raise
+
+# --- API Views ---
 class DataAnalysisAPIView(APIView):
     parser_classes = (MultiPartParser, FormParser, JSONParser)
 
     def __init__(self):
         super().__init__()
-        self.llm = None
-        self.prompt_template = None
+        self.sql_agent = None
         try:
             self.db_uri = settings.DATABASE_URL
+            self.api_key = get_api_key()
         except AttributeError:
             raise Exception("DATABASE_URL not found in Django settings")
-        self.initialize_llm()
 
-    def initialize_llm(self):
-        try:
-            self.prompt_template, self.llm = setup_llm()
-            if self.llm is None:
-                raise Exception("Failed to initialize LLM")
-        except Exception as e:
-            raise Exception(f"Error initializing LLM: {str(e)}")
-
-
+    def get_sql_agent(self):
+        if self.sql_agent is None:
+            try:
+                self.sql_agent = OptimizedSQLReActAgent(self.db_uri, self.api_key)
+                logger.info("SQL ReAct Agent initialized")
+            except Exception as e:
+                logger.error(f"Error initializing SQL agent: {str(e)}")
+                raise
+        return self.sql_agent
 
     def post(self, request, *args, **kwargs):
-        """Handle both file uploads and analysis queries"""
         content_type = request.content_type if hasattr(request, 'content_type') else ''
         
         if content_type and 'multipart/form-data' in content_type:
@@ -580,7 +801,6 @@ class DataAnalysisAPIView(APIView):
             return Response({
                 'error': f'Unsupported content type: {content_type}'
             }, status=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE)
-
 
     def handle_file_upload(self, request):
         try:
@@ -600,30 +820,69 @@ class DataAnalysisAPIView(APIView):
                 }, status=status.HTTP_400_BAD_REQUEST)
 
             engine = create_engine(self.db_uri)
-            clear_database_tables(engine)
+            
+            # Clear ONLY uploads schema (permanent data safe)
+            clear_uploaded_data_tables(engine)
 
+            tables_created = []
+            total_rows = 0
+            total_cols = 0
+            
             if isinstance(processed_data, dict):
-                tables_created = []
                 for sheet_name, df in processed_data.items():
                     table_name = re.sub(r'[^\w]', '_', sheet_name.lower())
-                    df.to_sql(table_name, engine, if_exists='replace', index=False)
-                    tables_created.append(table_name)
-
-                return Response({
-                    'success': True,
-                    'message': 'Multiple tables created successfully',
-                    'tables': tables_created
-                })
+                    # Save to uploads schema
+                    df.to_sql(
+                        table_name,
+                        engine,
+                        schema='uploads',  # CRITICAL: Save to uploads schema
+                        if_exists='replace',
+                        index=False
+                    )
+                    tables_created.append(f"uploads.{table_name}")
+                    total_rows += len(df)
+                    total_cols = max(total_cols, len(df.columns))
             else:
                 table_name = 'main_data'
-                processed_data.to_sql(table_name, engine, if_exists='replace', index=False)
-                return Response({
-                    'success': True,
-                    'message': 'Table created successfully',
-                    'table': table_name
-                })
+                processed_data.to_sql(
+                    table_name,
+                    engine,
+                    schema='uploads',  # CRITICAL: Save to uploads schema
+                    if_exists='replace',
+                    index=False
+                )
+                tables_created.append(f"uploads.{table_name}")
+                total_rows = len(processed_data)
+                total_cols = len(processed_data.columns)
+            
+            # Track upload in permanent table
+            try:
+                # Mark all previous files as inactive
+                UploadedFile.objects.filter(is_active=True).update(is_active=False)
+                
+                # Create new upload record
+                UploadedFile.objects.create(
+                    filename=uploaded_file.name,
+                    file_size=uploaded_file.size,
+                    file_type=file_extension.replace('.', ''),
+                    tables_created=tables_created,
+                    row_count=total_rows,
+                    column_count=total_cols,
+                    is_active=True
+                )
+            except Exception as e:
+                logger.warning(f"Could not save upload metadata: {e}")
+            
+            return Response({
+                'success': True,
+                'message': 'File uploaded successfully',
+                'tables': tables_created,
+                'rows': total_rows,
+                'columns': total_cols
+            })
 
         except Exception as e:
+            logger.error(f"File upload error: {str(e)}")
             return Response({
                 'error': f'Error processing file: {str(e)}'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -634,118 +893,112 @@ class DataAnalysisAPIView(APIView):
     def handle_analysis_query(self, request):
         try:
             user_question = request.data.get('query')
+            session_id = request.data.get('session_id', 'default')
+            
             if not user_question:
                 return Response({
                     'error': 'Please provide a question.'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
+            # Check if uploads schema has tables
             engine = create_engine(self.db_uri)
-            schema_str = self.get_schema_info(engine)
+            try:
+                with engine.connect() as conn:
+                    tables_query = """
+                        SELECT COUNT(*) FROM information_schema.tables 
+                        WHERE table_schema = 'uploads'
+                    """
+                    result = conn.execute(text(tables_query))
+                    table_count = result.scalar()
+                    
+                    if table_count == 0:
+                        return Response({
+                            'error': 'No data available. Please upload a file first.'
+                        }, status=status.HTTP_400_BAD_REQUEST)
+            finally:
+                engine.dispose()
 
-            result = generate_and_execute_query(
-                user_question,
-                schema_str,
-                self.llm,
-                self.db_uri
-            )
+            # Use SQL Agent
+            gemini_rate_limiter.wait_if_needed()
+            
+            try:
+                agent = self.get_sql_agent()
+                result = agent.query(user_question)
+            except Exception as agent_error:
+                logger.error(f"Agent error: {str(agent_error)}")
+                return Response({
+                    'error': f'Error processing query: {str(agent_error)}'
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
             if result['success']:
-                if not result['results'].empty:
-                    results_dict = result['results'].to_dict(orient='records')
+                if result.get('results') is not None and not result['results'].empty:
+                    sanitized_results = sanitize_dataframe_for_json(result['results'])
+                    results_dict = sanitized_results.to_dict(orient='records')
+                    
+                    agent = self.get_sql_agent()
                     explanation = generate_result_explanation(
                         result['results'],
                         user_question,
-                        self.llm
+                        agent.llm
                     )
 
-                    return Response({
+                    response_data = {
                         'success': True,
-                        'query': result['query'],
+                        'query': result.get('query', ''),
                         'results': results_dict,
                         'explanation': explanation
-                    })
+                    }
+                    
+                    # Save to chat history
+                    try:
+                        ChatHistory.objects.create(
+                            session_id=session_id,
+                            query=user_question,
+                            response=explanation,
+                            sql_query=result.get('query', ''),
+                            results_count=len(results_dict)
+                        )
+                    except Exception as e:
+                        logger.warning(f"Could not save chat history: {e}")
+                    
+                    if 'message' in result:
+                        response_data['message'] = result['message']
+                        
+                    return Response(response_data)
                 else:
+                    # No results
+                    try:
+                        ChatHistory.objects.create(
+                            session_id=session_id,
+                            query=user_question,
+                            response=result.get('explanation', 'No results found'),
+                            sql_query=result.get('query', ''),
+                            results_count=0
+                        )
+                    except Exception as e:
+                        logger.warning(f"Could not save chat history: {e}")
+                    
                     return Response({
                         'success': True,
-                        'message': 'No results found',
-                        'query': result['query']
+                        'message': result.get('explanation', 'No results found for your query.'),
+                        'query': result.get('query', ''),
+                        'results': [],
+                        'explanation': result.get('explanation', 'No data matches your criteria.')
                     })
             else:
+                error_msg = result.get('error', 'Unable to process your query.')
                 return Response({
-                    'error': result['error']
-                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                    'error': error_msg,
+                    'query': result.get('query', '')
+                }, status=status.HTTP_400_BAD_REQUEST)
 
         except Exception as e:
+            logger.error(f"Analysis query handler error: {str(e)}")
             return Response({
-                'error': f'Analysis error: {str(e)}'
+                'error': f'Error: {str(e)}'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        finally:
-            if 'engine' in locals():
-                engine.dispose()
 
-    def get_schema_info(self, engine):
-    
-        try:
-            with engine.connect() as conn:
-                # Get all tables
-                tables_query = """
-                    SELECT table_name 
-                    FROM information_schema.tables 
-                    WHERE table_schema = 'public'
-                        AND table_name != ''  
-                        AND EXISTS (
-                            SELECT 1 
-                            FROM information_schema.columns 
-                            WHERE table_name = tables.table_name
-                        )
-                """
-                tables = pd.read_sql_query(tables_query, conn)
-                
-                schema_str = "Available tables and their columns:\n\n"
-                for table_name in tables['table_name']:
-                    # Get column information
-                    columns_query = f"""
-                        SELECT column_name, data_type 
-                        FROM information_schema.columns 
-                        WHERE table_name = '{table_name}'
-                    """
-                    columns = pd.read_sql_query(columns_query, conn)
-                    
-                    # Get sample data
-                    sample_query = f"SELECT * FROM {table_name} LIMIT 3"
-                    sample_rows = pd.read_sql_query(sample_query, conn)
-                    
-                    schema_str += f"Table: {table_name}\n"
-                    schema_str += "Columns:\n"
-                    for _, col in columns.iterrows():
-                        col_name = col['column_name']
-                        col_type = col['data_type']
-                        sample_vals = sample_rows[col_name].tolist() if not sample_rows.empty else ['NULL']
-                        schema_str += f"- {col_name} ({col_type}) - Samples: {', '.join(str(v) for v in sample_vals)}\n"
-                    schema_str += "\n"
-                
-                return schema_str
-                
-        except Exception as e:
-            raise Exception(f"Error getting schema info: {str(e)}")
 
-    def get_db_uri(self):
-        """Get database URI from Django settings""" 
-        try:
-            return settings.DATABASE_URL
-        except AttributeError:
-            raise Exception("DATABASE_URL not found in settings")
-    
-    def cleanup_temporary_files(self):
-        """Clean up temporary files after processing"""
-        try:
-            # Add cleanup logic
-            pass
-        except Exception as e:
-            logger.error(f"Error during cleanup: {str(e)}")
-
-    
-    
 class SaveResultsAPIView(APIView):
     def post(self, request):
         try:
@@ -755,24 +1008,121 @@ class SaveResultsAPIView(APIView):
                     'error': 'No results to save'
                 }, status=status.HTTP_400_BAD_REQUEST)
             
-            # Convert results to DataFrame
             results_df = pd.DataFrame(results_data)
+            results_df = sanitize_dataframe_for_json(results_df)
             
-            # Create a string buffer to store the CSV data
             csv_buffer = StringIO()
             results_df.to_csv(csv_buffer, index=False)
             csv_buffer.seek(0)
             
-            # Create the HTTP response with the CSV file
             filename = f'query_results_{pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")}.csv'
             response = HttpResponse(csv_buffer.getvalue(), content_type='text/csv')
             response['Content-Disposition'] = f'attachment; filename="{filename}"'
             
             return response
-            
         except Exception as e:
             return Response({
                 'error': f'Error saving results: {str(e)}'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-   
-       
+
+
+class DataVisualizationAPIView(APIView):
+    parser_classes = (JSONParser,)
+    
+    def __init__(self):
+        super().__init__()
+        self.visualization_agent = None
+        try:
+            self.visualization_agent = VisualizationAgent()
+            logger.info("Visualization agent initialized")
+        except Exception as e:
+            logger.error(f"Error initializing visualization agent: {str(e)}")
+    
+    def post(self, request, *args, **kwargs):
+        try:
+            results_data = request.data.get('results', [])
+            question = request.data.get('question', '')
+            
+            if not results_data:
+                return Response({
+                    'error': 'No data provided for visualization'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            if len(results_data) > 500:
+                results_data = results_data[:500]
+            
+            df = pd.DataFrame(results_data)
+            
+            if df.empty:
+                return Response({
+                    'error': 'Empty dataset provided'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            analysis_result = self.visualization_agent.analyze(df, question)
+            
+            if not analysis_result['success']:
+                return Response({
+                    'error': analysis_result.get('error', 'Visualization analysis failed')
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            
+            charts_with_data = []
+            for chart_config in analysis_result['charts'][:2]:
+                try:
+                    chart_data = ChartDataGenerator.prepare_chart_data(df, chart_config)
+                    charts_with_data.append({
+                        **chart_config,
+                        'chartData': chart_data
+                    })
+                except Exception as e:
+                    logger.error(f"Error preparing chart data: {str(e)}")
+                    continue
+            
+            simplified_summary = {
+                'row_count': analysis_result['summary'].get('row_count', 0),
+                'column_count': analysis_result['summary'].get('column_count', 0),
+                'numeric_columns': analysis_result['summary'].get('numeric_columns', []),
+                'categorical_columns': analysis_result['summary'].get('categorical_columns', [])
+            }
+            
+            return Response({
+                'success': True,
+                'summary': simplified_summary,
+                'charts': charts_with_data,
+                'insights': analysis_result['insights']
+            })
+        except Exception as e:
+            logger.error(f"Error in visualization endpoint: {str(e)}")
+            return Response({
+                'error': f'Visualization error: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class ChatHistoryAPIView(APIView):
+    """API to retrieve chat history"""
+    def get(self, request):
+        try:
+            session_id = request.GET.get('session_id', 'default')
+            limit = int(request.GET.get('limit', 50))
+            
+            history = ChatHistory.objects.filter(
+                session_id=session_id
+            ).order_by('-created_at')[:limit]
+            
+            history_data = [{
+                'id': str(item.id),
+                'query': item.query,
+                'response': item.response,
+                'sql_query': item.sql_query,
+                'results_count': item.results_count,
+                'created_at': item.created_at.isoformat()
+            } for item in history]
+            
+            return Response({
+                'success': True,
+                'history': history_data
+            })
+        except Exception as e:
+            logger.error(f"Error fetching chat history: {str(e)}")
+            return Response({
+                'error': f'Error: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

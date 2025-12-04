@@ -10,17 +10,23 @@ SQLAlchemy>=2.0.0
 
 # AI/ML
 langchain>=0.1.0
+langgraph>=0.2.0
+langchain-google-genai>=2.0.0
+langchain-community>=0.3.0
 google-cloud-aiplatform>=1.36.0
 google-generativeai>=0.3.0
 
 # Data processing
 pandas>=2.0.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
 
 # Environment variables
 python-dotenv>=1.0.0
 
 # Azure specific
-gunicorn>=21.1.0
+# gunicorn>=21.1.0
 whitenoise==6.8.2  # for serving static files
 psycopg2==2.9.10    # for PostgreSQL support
 
