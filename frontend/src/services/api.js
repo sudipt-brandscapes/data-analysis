@@ -105,6 +105,68 @@ export const getChatHistory = async (sessionId) => {
   }
 };
 
+// Stream Analysis
+export const streamAnalysis = async (query, sessionId, callbacks, signal) => {
+    const { onToken, onStatus, onComplete, onError } = callbacks;
+    
+    try {
+        const response = await fetch(`${API_CONFIG.BASE_URL}/api/analysis/`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ query, session_id: sessionId, stream: true }),
+            signal: signal 
+        });
+
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+
+            const chunk = decoder.decode(value, { stream: true });
+            buffer += chunk;
+            
+            const lines = buffer.split('\n\n');
+            buffer = lines.pop(); // Keep incomplete line in buffer
+
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    const dataStr = line.replace('data: ', '');
+                    try {
+                        const event = JSON.parse(dataStr);
+                        
+                        if (event.type === 'token') {
+                            onToken(event.content);
+                        } else if (event.type === 'status') {
+                            onStatus(event.content);
+                        } else if (event.type === 'complete') {
+                            onComplete(event.data);
+                        } else if (event.type === 'error') {
+                            onError(event.error);
+                        }
+                    } catch (e) {
+                        console.error('Error parsing SSE:', e);
+                    }
+                }
+            }
+        }
+    } catch (error) {
+        if (error.name === 'AbortError') {
+             console.log('Stream aborted');
+        } else {
+             onError(error.message);
+        }
+    }
+};
+
 export const getChatSessions = async () => {
     try {
         const response = await api.get('/api/chat-sessions/');

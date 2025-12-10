@@ -1,9 +1,9 @@
 import { useState, useRef, useEffect } from 'react';
-import { ArrowUp, Paperclip } from 'lucide-react';
+import { ArrowUp, Paperclip, Square } from 'lucide-react';
 import PropTypes from 'prop-types';
 import { motion } from 'framer-motion';
 
-export const QueryInput = ({ onAnalyze, loading, initialQuery = '', mode = 'centered' }) => {
+export const QueryInput = ({ onAnalyze, loading, initialQuery = '', mode = 'centered', onStop }) => {
   const [query, setQuery] = useState(initialQuery);
   const textareaRef = useRef(null);
 
@@ -16,8 +16,13 @@ export const QueryInput = ({ onAnalyze, loading, initialQuery = '', mode = 'cent
 
   const handleSubmit = (e) => {
     if (e) e.preventDefault();
+    if (loading && onStop) {
+        onStop();
+        return;
+    }
     if (query.trim() && !loading) {
       onAnalyze(query);
+      setQuery(''); // Clear query after submit
     }
   };
 
@@ -47,17 +52,9 @@ export const QueryInput = ({ onAnalyze, loading, initialQuery = '', mode = 'cent
         
         <form 
           onSubmit={handleSubmit}
-          className={`relative flex items-end gap-2 p-3 bg-gray-950/80 border border-gray-800 rounded-2xl shadow-2xl backdrop-blur-xl transition-colors  ${
-            loading ? 'opacity-70 cursor-not-allowed' : ''
-          }`}
+          className={`relative flex items-end gap-2 p-3 bg-gray-950/80 border border-gray-800 rounded-2xl shadow-2xl backdrop-blur-xl transition-colors`}
         >
-          {/* <button
-            type="button"
-            className="p-2 text-gray-400 hover:text-white hover:bg-gray-800 rounded-lg transition-colors"
-            title="Upload file"
-          >
-            <Paperclip size={20} />
-          </button> */}
+          {/* File Upload Button (Commented out) */}
 
           <textarea
             ref={textareaRef}
@@ -70,17 +67,28 @@ export const QueryInput = ({ onAnalyze, loading, initialQuery = '', mode = 'cent
             disabled={loading}
           />
 
-          <button
-            type="submit"
-            disabled={!query.trim() || loading}
-            className={`p-2 rounded-lg transition-all duration-200 ${
-              query.trim() && !loading
-                ? 'bg-blue-600 text-white shadow-lg hover:bg-blue-500'
-                : 'bg-gray-800 text-gray-500 cursor-not-allowed'
-            }`}
-          >
-            <ArrowUp size={20} />
-          </button>
+          {loading ? (
+             <button
+                type="button"
+                onClick={onStop}
+                className="p-2 rounded-lg bg-red-500/10 text-red-500 hover:bg-red-500/20 transition-all duration-200"
+                title="Stop Analysis"
+             >
+                <Square size={20} fill="currentColor" />
+             </button>
+          ) : (
+            <button
+                type="submit"
+                disabled={!query.trim()}
+                className={`p-2 rounded-lg transition-all duration-200 ${
+                query.trim()
+                    ? 'bg-blue-600 text-white shadow-lg hover:bg-blue-500'
+                    : 'bg-gray-800 text-gray-500 cursor-not-allowed'
+                }`}
+            >
+                <ArrowUp size={20} />
+            </button>
+          )}
         </form>
       </div>
       

@@ -10,7 +10,10 @@ import { QueryInput, AnalysisResult } from '../features';
 import { LoadingSpinner, ErrorMessage } from '../common';
 import { uploadFile, executeAnalysis, generateVisualizations, getChatHistory } from '../../services/api';
 
-export const AnalysisPage = ({ selectedQuestion = '', initialSessionId = null, isNewSession = false, onBackToDashboard }) => {
+import { useNavigate } from 'react-router-dom';
+
+export const AnalysisPage = ({ selectedQuestion = '', urlSessionId = null, onBackToDashboard }) => {
+  const navigate = useNavigate();
   const [file, setFile] = useState(null);
   const [query, setQuery] = useState('');
   // chatItems structure: { type: 'user' | 'analysis', content?: string, result?: object, visualizations?: object, id: string }
@@ -33,59 +36,35 @@ export const AnalysisPage = ({ selectedQuestion = '', initialSessionId = null, i
   };
 
   const handleNewChat = () => {
-      const newId = generateUUID();
-      localStorage.setItem('analysis_session_id', newId);
-      window.location.reload(); 
+      // Navigate to root analysis, which will redirect to new UUID
+      navigate('/analysis');
   };
   
-  const [sessionIdState, setSessionIdState] = useState(() => {
-    // If explicit new session requested
-    if (isNewSession) {
-        const newId = generateUUID();
-        localStorage.setItem('analysis_session_id', newId);
-        return newId;
-    }
-    // If specific session requested
-    if (initialSessionId) {
-        localStorage.setItem('analysis_session_id', initialSessionId);
-        return initialSessionId;
-    }
-    // Otherwise check storage or create new default
-    const stored = localStorage.getItem('analysis_session_id');
-    if (stored) return stored;
-    const newId = generateUUID();
-    localStorage.setItem('analysis_session_id', newId);
-    return newId;
-  });
+  // NOTE: Session ID is controlled by URL.
+  // If URL has ID, we use it. If not, we wait for user to start chat.
+  const [sessionIdState, setSessionIdState] = useState(urlSessionId);
 
   useEffect(() => {
-      // If we receive a new session instruction via props that differs from current state
-      if (isNewSession) {
-           // Check if we are ALREADY on a new session to avoid infinite loops or overwrites if we navigated here
-           // But since isNewSession comes from URL, validation is tricky.
-           // However, useState initialization handles the FIRST render. 
-           // This useEffect handles subsequent updates if props change (unlikely for URL params without navigation)
-           // But let's be safe. If we are forced new, we ensure we have a fresh ID.
-           // actually, the useState init logic is enough for the initial load.
-           // We only need to react if initialSessionId changes.
-      } else if (initialSessionId && initialSessionId !== sessionIdState) {
-          setSessionIdState(initialSessionId);
-          localStorage.setItem('analysis_session_id', initialSessionId);
+      if (urlSessionId) {
+          setSessionIdState(urlSessionId);
+          localStorage.setItem('analysis_session_id', urlSessionId);
+      } else {
+          setSessionIdState(null);
+          // Don't auto-generate or redirect yet.
       }
-  }, [initialSessionId, isNewSession]);
+  }, [urlSessionId]);
 
   const startNewChat = () => {
-     const newId = generateUUID();
-     localStorage.setItem('analysis_session_id', newId);
-     setSessionIdState(newId);
-     setChatItems([]);
-     setQuery('');
-     setFile(null);
-     setIsFileUploaded(false);
+     handleNewChat();
   };
 
   useEffect(() => {
     const loadHistory = async () => {
+        if (!sessionIdState) {
+            setChatItems([]);
+            return;
+        }
+        
         try {
             const history = await getChatHistory(sessionIdState);
             if (history && history.length > 0) {
@@ -115,9 +94,7 @@ export const AnalysisPage = ({ selectedQuestion = '', initialSessionId = null, i
             setChatItems([]);
         }
     };
-    if (sessionIdState) {
-        loadHistory();
-    }
+    loadHistory();
   }, [sessionIdState]);
 
   useEffect(() => {
@@ -166,6 +143,18 @@ export const AnalysisPage = ({ selectedQuestion = '', initialSessionId = null, i
     }
   };
 
+  /* New Ref for AbortController */
+  const abortControllerRef = useRef(null);
+
+  const handleStop = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+      setLoading(false);
+      // Optional: Add a system message saying "Analysis stopped by user"
+    }
+  };
+
   const handleAnalyze = async (queryText) => {
     if (!file || !queryText.trim()) {
       setError('Please provide a question');
@@ -179,45 +168,103 @@ export const AnalysisPage = ({ selectedQuestion = '', initialSessionId = null, i
 
     const newQueryId = generateUUID();
     const userItem = { id: `user-${newQueryId}`, type: 'user', content: queryText };
-    setChatItems(prev => [...prev, userItem]);
+    const aiItemId = `ai-${newQueryId}`;
+    /* Initialize AI Item with empty content for streaming */
+    const aiItem = {
+          id: aiItemId,
+          type: 'analysis',
+          result: { explanation: '', results: [] }, // Start empty
+          visualizations: null 
+    };
+
+    setChatItems(prev => [...prev, userItem, aiItem]);
     
     setLoading(true);
     setError('');
     setAnalyzingItemId(newQueryId);
+    
+    // Create AbortController for this request
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    // Determine Session ID (existing or new)
+    let currentSessionId = sessionIdState;
+    if (!currentSessionId) {
+        currentSessionId = generateUUID();
+        // Update URL to reflect new session, but don't force reload
+        navigate(`/analysis/${currentSessionId}`, { replace: true });
+        setSessionIdState(currentSessionId); 
+    }
 
     try {
-      const data = await executeAnalysis(queryText, sessionIdState);
-      
-      const aiItemId = `ai-${newQueryId}`;
-      const aiItem = {
-          id: aiItemId,
-          type: 'analysis',
-          result: data,
-          visualizations: null 
-      };
-      
-      setChatItems(prev => [...prev, aiItem]);
+      // Import dynamically or assume it's imported at top
+      const { streamAnalysis } = await import('../../services/api'); // Dynamic import to ensure latest
 
-      if (data.results && data.results.length > 0) {
-        setLoadingViz(true);
-        try {
-          const vizData = await generateVisualizations(data.results, queryText);
-          setChatItems(prev => prev.map(item => 
-              item.id === aiItemId 
-                ? { ...item, visualizations: vizData } 
-                : item
-          ));
-        } catch (vizError) {
-          console.error('Visualization error:', vizError);
-        } finally {
-          setLoadingViz(false);
-        }
-      }
+      await streamAnalysis(queryText, currentSessionId, {
+          onToken: (token) => {
+               setChatItems(prev => prev.map(item => 
+                   item.id === aiItemId 
+                   ? { 
+                       ...item, 
+                       result: { 
+                           ...item.result, 
+                           explanation: (item.result.explanation || '') + token 
+                       } 
+                   } 
+                   : item
+               ));
+          },
+          onStatus: (status) => {
+               // Optional: Show status indicator
+               // For now, maybe prepending to explanation or separate status UI?
+               // Let's just ignore or console log for now, or update a status bar
+               console.log("Status:", status);
+          },
+          onComplete: async (data) => {
+               // Update with final data structure (has results, sql, etc)
+               // Note: data.explanation might be full text, but we streamed it. 
+               // Using streamed text is better visulally.
+               setChatItems(prev => prev.map(item => 
+                   item.id === aiItemId 
+                   ? { 
+                       ...item, 
+                       result: data 
+                   } 
+                   : item
+               ));
+
+               if (data.results && data.results.length > 0) {
+                    setLoadingViz(true);
+                    try {
+                        const vizData = await generateVisualizations(data.results, queryText);
+                        setChatItems(prev => prev.map(item => 
+                            item.id === aiItemId 
+                                ? { ...item, visualizations: vizData } 
+                                : item
+                        ));
+                    } catch (e) {
+                        console.error("Viz Error", e);
+                    } finally {
+                        setLoadingViz(false);
+                    }
+               }
+               setLoading(false);
+               abortControllerRef.current = null;
+          },
+          onError: (errMsg) => {
+               setError(errMsg);
+               setLoading(false);
+               abortControllerRef.current = null;
+          }
+      }, controller.signal); // Pass signal
+
     } catch (error) {
       console.error('Analysis error:', error);
-      setError(error.response?.data?.error || 'Analysis failed. Please try again.');
-    } finally {
+      setError('Analysis failed.');
       setLoading(false);
+      abortControllerRef.current = null;
+    } finally {
+      // setLoading(false); // Done in onComplete/onError
       setAnalyzingItemId(null);
     }
   };
@@ -225,19 +272,7 @@ export const AnalysisPage = ({ selectedQuestion = '', initialSessionId = null, i
   const hasInteracted = chatItems.length > 0 || loading;
 
   const handleChatSelect = (session) => {
-      localStorage.setItem('analysis_session_id', session.id);
-      setSessionIdState(session.id);
-      setIsFileUploaded(true); // Assume file uploaded for past sessions? Or check sidebar metadata?
-      // Better to reset file upload state or assume valid if history exists.
-      // But user might want to continue analyzing. 
-      // If session exists, we load history. `isFileUploaded` prevents new analysis if false.
-      // We should probably allow analysis if session context is rich, but strictly requiring file re-upload is safer for now
-      // unless we store file metadata in session.
-      // For now, let's NOT block analysis if we are viewing history, or maybe just leave it as is.
-      // Actually, if they switch sessions, they might need to re-upload file if the backend doesn't persist file context per session effectively in 'uploads' schema.
-      // The current backend clears 'uploads' schema on new file upload.
-      // So old sessions might not work for NEW queries if the file is gone. 
-      // This is a known limitation. We will just load the history.
+      navigate(`/analysis/${session.id}`);
   };
 
   return (
@@ -269,16 +304,17 @@ export const AnalysisPage = ({ selectedQuestion = '', initialSessionId = null, i
                           <Activity className="w-8 h-8 text-white" />
                        </div>
                     </div>
-                    
+
                     <QueryInput
                       onAnalyze={handleAnalyze}
                       loading={loading}
                       initialQuery={query}
                       mode="centered"
+                      onStop={handleStop}
                     />
 
                     {error && (
-                      <motion.div 
+                      <motion.div
                         initial={{ opacity: 0, y: 10 }}
                         animate={{ opacity: 1, y: 0 }}
                         className="max-w-md mx-auto"

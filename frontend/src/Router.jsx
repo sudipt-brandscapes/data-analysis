@@ -5,6 +5,7 @@ import {
   Navigate,
   useNavigate,
   useSearchParams,
+  useParams,
 } from "react-router-dom";
 import { LandingPage, DashboardPage, AnalysisPage } from "./components/pages";
 
@@ -25,15 +26,16 @@ function DashboardWrapper() {
   const handleQuestionSelect = (item) => {
     if (item && typeof item === 'object' && item.id) {
        // It's a session object
-       navigate(`/analysis?sessionId=${item.id}`);
+       navigate(`/analysis/${item.id}`);
     } else if (item === 'NEW_SESSION') {
        // Force new session
-       navigate(`/analysis?new=true`);
+       navigate(`/analysis`);
     } else if (item && typeof item === 'string') {
-       // It's a query string (search)
+       // It's a query string (search) -> New session with initial query
+       // We'll pass it as state or query param to /analysis
        navigate(`/analysis?q=${encodeURIComponent(item)}`);
     } else {
-       // Default (shouldn't really happen with updated Dashboard, but fallback)
+       // Default new analysis
       navigate("/analysis");
     }
   };
@@ -42,21 +44,23 @@ function DashboardWrapper() {
 }
 
 function AnalysisWrapper() {
+  const { sessionId } = useParams(); // Get from URL /analysis/:sessionId
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   const selectedQuestion = searchParams.get("q") || "";
-  const sessionId = searchParams.get("sessionId") || null;
-  const isNewSession = searchParams.get("new") === "true";
 
   const handleBackToDashboard = () => {
     navigate("/dashboard");
   };
+  
+  // We pass sessionId from URL. If undefined, AnalysisPage should handle creation + redirect.
+  // Or we can handle creation here? Better in Page or via a redirect effect.
+  // Actually, let's let AnalysisPage handle the "no session id" case by creating one and replacing URL.
 
   return (
     <AnalysisPage
       selectedQuestion={selectedQuestion}
-      initialSessionId={sessionId}
-      isNewSession={isNewSession}
+      urlSessionId={sessionId}
       onBackToDashboard={handleBackToDashboard}
     />
   );
@@ -72,8 +76,11 @@ function Router() {
         {/* Dashboard with sample questions */}
         <Route path="/dashboard" element={<DashboardWrapper />} />
 
-        {/* Analysis Page */}
+        {/* Analysis Page - New Chat */}
         <Route path="/analysis" element={<AnalysisWrapper />} />
+        
+        {/* Analysis Page - Specific Chat */}
+        <Route path="/analysis/:sessionId" element={<AnalysisWrapper />} />
 
         {/* Redirect any unknown routes to landing */}
         <Route path="*" element={<Navigate to="/" replace />} />

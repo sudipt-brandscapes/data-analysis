@@ -2,18 +2,16 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+from rest_framework.parsers import JSONParser
 from django.conf import settings
-from django.http import HttpResponse
+from django.http import HttpResponse, StreamingHttpResponse
 
-from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SQLDatabase
 from langchain_community.agent_toolkits.sql.toolkit import SQLDatabaseToolkit
 from langgraph.prebuilt import create_react_agent
 
 from langchain_postgres import PostgresChatMessageHistory
-from langchain_core.messages import HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 import os
@@ -365,16 +363,185 @@ Return ONLY the fixed query:"""
             logger.error(f"Query fix error: {str(e)}")
             return None
 
-    def _generate_explanation(self, results_df: pd.DataFrame, question: str) -> str:
+    def stream_query_with_conversation(self, user_input: str):
+        """Generator that streams the analysis process"""
+        try:
+            gemini_rate_limiter.wait_if_needed()
+            yield {"type": "status", "content": "Analyzing request..."}
+
+            # Get schema info
+            schema_info = self._get_schema_fast()
+
+            # Get chat history
+            messages = self.message_history.messages
+
+            # Format prompt
+            formatted_prompt = self.prompt.format_messages(
+                schema_info=schema_info, chat_history=messages, input=user_input
+            )
+
+            # 1. Initial Planning (Generate SQL or Clarify)
+            # We don't stream this part to user yet as it contains raw SQL/Actions
+            response = self.llm.invoke(formatted_prompt)
+            response_text = response.content.strip()
+
+            # Check if LLM needs clarification
+            if "ACTION: CLARIFY" in response_text:
+                question_match = re.search(
+                    r"QUESTION:\s*(.+)", response_text, re.DOTALL
+                )
+                clarifying_question = (
+                    question_match.group(1).strip() if question_match else response_text
+                )
+
+                self.message_history.add_user_message(user_input)
+                self.message_history.add_ai_message(clarifying_question)
+
+                # Stream the clarification as answer
+                yield {"type": "token", "content": clarifying_question}
+                yield {
+                    "type": "complete",
+                    "data": {
+                        "success": True,
+                        "needs_clarification": True,
+                        "question": clarifying_question,
+                        "explanation": clarifying_question,
+                    },
+                }
+                return
+
+            # Extract SQL query
+            sql_match = re.search(r"SQL:\s*(.+)", response_text, re.DOTALL)
+            if sql_match:
+                sql_query = sql_match.group(1).strip()
+                sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
+            else:
+                sql_match = re.search(
+                    r"(SELECT\s+.+)", response_text, re.IGNORECASE | re.DOTALL
+                )
+                if sql_match:
+                    sql_query = sql_match.group(1).strip()
+                else:
+                    # Treat as clarification
+                    self.message_history.add_user_message(user_input)
+                    self.message_history.add_ai_message(response_text)
+                    yield {"type": "token", "content": response_text}
+                    yield {
+                        "type": "complete",
+                        "data": {
+                            "success": True,
+                            "needs_clarification": True,
+                            "question": response_text,
+                            "explanation": response_text,
+                        },
+                    }
+                    return
+
+            # Security check
+            if self._is_query_unsafe(sql_query):
+                error_msg = (
+                    "Cannot query system tables. Only uploaded data can be queried."
+                )
+                self.message_history.add_user_message(user_input)
+                self.message_history.add_ai_message(error_msg)
+                yield {"type": "token", "content": error_msg}
+                yield {"type": "error", "error": error_msg}
+                return
+
+            # Execute query
+            yield {"type": "status", "content": "Executing SQL..."}
+            results = self._execute_query(sql_query)
+
+            if results is None:
+                # Retry logic
+                corrected_query = self._fix_query_fast(
+                    sql_query, user_input, schema_info
+                )
+                if corrected_query and not self._is_query_unsafe(corrected_query):
+                    results = self._execute_query(corrected_query)
+                    if results is not None:
+                        sql_query = corrected_query
+
+            if results is None:
+                error_msg = "Query execution failed. Could you rephrase your question?"
+                self.message_history.add_user_message(user_input)
+                self.message_history.add_ai_message(error_msg)
+                yield {"type": "token", "content": error_msg}
+                yield {"type": "error", "error": error_msg}
+                return
+
+            # Generate Explanation (Streamed)
+            yield {"type": "status", "content": "Generating explanation..."}
+
+            # Use LLM to explain results
+            full_explanation = ""
+            for token in self._generate_explanation_stream(results, user_input):
+                full_explanation += token
+                yield {"type": "token", "content": token}
+
+            # Save to memory
+            self.message_history.add_user_message(user_input)
+            self.message_history.add_ai_message(full_explanation)
+
+            # Sanitize results for JSON
+            sanitized_results = (
+                sanitize_dataframe_for_json(results)
+                if not results.empty
+                else pd.DataFrame()
+            )
+            results_dict = (
+                sanitized_results.to_dict(orient="records") if not results.empty else []
+            )
+
+            yield {
+                "type": "complete",
+                "data": {
+                    "success": True,
+                    "results": results_dict,  # Send full results at end
+                    "query": sql_query,
+                    "explanation": full_explanation,
+                    "needs_clarification": False,
+                },
+            }
+
+        except Exception as e:
+            logger.error(f"Error in streaming: {str(e)}")
+            yield {"type": "error", "error": str(e)}
+
+    def _generate_explanation_stream(self, results_df: pd.DataFrame, question: str):
+        """Streams explanation of results using LLM"""
         try:
             if results_df.empty:
-                return "No results found for your query."
+                yield "No results found for your query."
+                return
 
+            # Summarize data for prompt
             row_count = len(results_df)
-            return f"Found {row_count} record{'s' if row_count != 1 else ''} matching your query."
+            preview = results_df.head(5).to_string()
+
+            prompt = f"""
+            Question: {question}
+            Data Results ({row_count} rows total):
+            {preview}
+            
+            Please provide a concise, natural language answer to the question based on the data results. 
+            Do not mention "DataFrame" or "technical code". Just answer the user.
+            """
+
+            # Stream response
+            for chunk in self.llm.stream(prompt):
+                if hasattr(chunk, "content"):
+                    yield chunk.content
+                else:
+                    yield str(chunk)
+
         except Exception as e:
-            logger.error(f"Error generating explanation: {str(e)}")
-            return "Query executed successfully."
+            logger.error(f"Error generating explanation stream: {str(e)}")
+            yield "Here are the results."
+
+    def _generate_explanation(self, results_df: pd.DataFrame, question: str) -> str:
+        # Fallback for non-streaming
+        return "".join(self._generate_explanation_stream(results_df, question))
 
 
 # --- Chart Generator ---
@@ -1215,8 +1382,11 @@ class DataAnalysisAPIView(APIView):
 
     def handle_analysis_query(self, request):
         try:
+            import json
+
             user_question = request.data.get("query")
             session_id = request.data.get("session_id", "default")
+            stream_response = request.data.get("stream", False)
 
             if not user_question:
                 return Response(
@@ -1243,9 +1413,6 @@ class DataAnalysisAPIView(APIView):
             finally:
                 engine.dispose()
 
-            # Use Conversational SQL Agent
-            gemini_rate_limiter.wait_if_needed()
-
             # Ensure Chat Session exists
             try:
                 if not ChatSession.objects.filter(session_id=session_id).exists():
@@ -1256,11 +1423,24 @@ class DataAnalysisAPIView(APIView):
             except Exception as e:
                 logger.error(f"Error creating session: {e}")
 
-            try:
-                # Create conversational agent with session
-                conv_agent = ConversationalSQLAgent(
-                    self.db_uri, self.api_key, session_id
+            # Create agent
+            gemini_rate_limiter.wait_if_needed()
+            conv_agent = ConversationalSQLAgent(self.db_uri, self.api_key, session_id)
+
+            if stream_response:
+
+                def event_stream():
+                    for event in conv_agent.stream_query_with_conversation(
+                        user_question
+                    ):
+                        yield f"data: {json.dumps(event)}\n\n"
+
+                return StreamingHttpResponse(
+                    event_stream(), content_type="text/event-stream"
                 )
+
+            # Normal execution
+            try:
                 result = conv_agent.query_with_conversation(user_question)
             except Exception as agent_error:
                 logger.error(f"Agent error: {str(agent_error)}")
@@ -1269,7 +1449,7 @@ class DataAnalysisAPIView(APIView):
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 )
 
-            # Handle clarification needed
+            # Handle clarification (Legacy non-stream logic)
             if result.get("needs_clarification"):
                 # Save to chat history
                 try:
@@ -1300,49 +1480,37 @@ class DataAnalysisAPIView(APIView):
                     response_data = {
                         "success": True,
                         "query": result.get("query", ""),
+                        "explanation": result.get("explanation", ""),
                         "results": results_dict,
-                        "explanation": result["explanation"],
+                    }
+                else:
+                    response_data = {
+                        "success": True,
+                        "message": result.get(
+                            "explanation", "No results found for your query."
+                        ),
+                        "query": result.get("query", ""),
+                        "results": [],
+                        "explanation": result.get(
+                            "explanation", "No data matches your criteria."
+                        ),
                     }
 
-                    # Save to chat history
-                    try:
-                        ChatHistory.objects.create(
-                            session_id=session_id,
-                            query=user_question,
-                            response=result["explanation"],
-                            sql_query=result.get("query", ""),
-                            results_count=len(results_dict),
-                        )
-                    except Exception as e:
-                        logger.warning(f"Could not save chat history: {e}")
-
-                    return Response(response_data)
-                else:
-                    # No results
-                    try:
-                        ChatHistory.objects.create(
-                            session_id=session_id,
-                            query=user_question,
-                            response=result.get("explanation", "No results found"),
-                            sql_query=result.get("query", ""),
-                            results_count=0,
-                        )
-                    except Exception as e:
-                        logger.warning(f"Could not save chat history: {e}")
-
-                    return Response(
-                        {
-                            "success": True,
-                            "message": result.get(
-                                "explanation", "No results found for your query."
-                            ),
-                            "query": result.get("query", ""),
-                            "results": [],
-                            "explanation": result.get(
-                                "explanation", "No data matches your criteria."
-                            ),
-                        }
+                # Save to chat history
+                try:
+                    ChatHistory.objects.create(
+                        session_id=session_id,
+                        query=user_question,
+                        response=result.get("explanation", ""),
+                        sql_query=result.get("query", ""),
+                        results_count=len(result.get("results", []))
+                        if hasattr(result.get("results"), "__len__")
+                        else 0,
                     )
+                except Exception as e:
+                    logger.warning(f"Could not save chat history: {e}")
+
+                return Response(response_data)
             else:
                 error_msg = result.get("error", "Unable to process your query.")
                 return Response(
@@ -1620,6 +1788,3 @@ class ChatSessionListAPIView(APIView):
             return Response(
                 {"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
-
-
-# ... (End of file)
