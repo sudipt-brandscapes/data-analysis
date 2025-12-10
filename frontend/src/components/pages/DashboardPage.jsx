@@ -175,14 +175,6 @@ export const DashboardPage = ({ onQuestionSelect }) => {
                   Transform your data into actionable insights with intelligent queries
                 </p>
               </div>
-              <Button
-                variant="primary"
-                size="md"
-                icon={ArrowRight}
-                onClick={() => onQuestionSelect('')}
-              >
-                New Analysis
-              </Button>
             </div>
           </Card>
 

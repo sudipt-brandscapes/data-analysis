@@ -26,11 +26,14 @@ function DashboardWrapper() {
     if (item && typeof item === 'object' && item.id) {
        // It's a session object
        navigate(`/analysis?sessionId=${item.id}`);
+    } else if (item === 'NEW_SESSION') {
+       // Force new session
+       navigate(`/analysis?new=true`);
     } else if (item && typeof item === 'string') {
-       // It's a query string
+       // It's a query string (search)
        navigate(`/analysis?q=${encodeURIComponent(item)}`);
     } else {
-       // New analysis
+       // Default (shouldn't really happen with updated Dashboard, but fallback)
       navigate("/analysis");
     }
   };
@@ -43,6 +46,7 @@ function AnalysisWrapper() {
   const navigate = useNavigate();
   const selectedQuestion = searchParams.get("q") || "";
   const sessionId = searchParams.get("sessionId") || null;
+  const isNewSession = searchParams.get("new") === "true";
 
   const handleBackToDashboard = () => {
     navigate("/dashboard");
@@ -52,6 +56,7 @@ function AnalysisWrapper() {
     <AnalysisPage
       selectedQuestion={selectedQuestion}
       initialSessionId={sessionId}
+      isNewSession={isNewSession}
       onBackToDashboard={handleBackToDashboard}
     />
   );

@@ -10,7 +10,7 @@ import { QueryInput, AnalysisResult } from '../features';
 import { LoadingSpinner, ErrorMessage } from '../common';
 import { uploadFile, executeAnalysis, generateVisualizations, getChatHistory } from '../../services/api';
 
-export const AnalysisPage = ({ selectedQuestion = '', initialSessionId = null, onBackToDashboard }) => {
+export const AnalysisPage = ({ selectedQuestion = '', initialSessionId = null, isNewSession = false, onBackToDashboard }) => {
   const [file, setFile] = useState(null);
   const [query, setQuery] = useState('');
   // chatItems structure: { type: 'user' | 'analysis', content?: string, result?: object, visualizations?: object, id: string }
@@ -39,10 +39,18 @@ export const AnalysisPage = ({ selectedQuestion = '', initialSessionId = null, o
   };
   
   const [sessionIdState, setSessionIdState] = useState(() => {
+    // If explicit new session requested
+    if (isNewSession) {
+        const newId = generateUUID();
+        localStorage.setItem('analysis_session_id', newId);
+        return newId;
+    }
+    // If specific session requested
     if (initialSessionId) {
         localStorage.setItem('analysis_session_id', initialSessionId);
         return initialSessionId;
     }
+    // Otherwise check storage or create new default
     const stored = localStorage.getItem('analysis_session_id');
     if (stored) return stored;
     const newId = generateUUID();
@@ -51,11 +59,20 @@ export const AnalysisPage = ({ selectedQuestion = '', initialSessionId = null, o
   });
 
   useEffect(() => {
-      if (initialSessionId && initialSessionId !== sessionIdState) {
+      // If we receive a new session instruction via props that differs from current state
+      if (isNewSession) {
+           // Check if we are ALREADY on a new session to avoid infinite loops or overwrites if we navigated here
+           // But since isNewSession comes from URL, validation is tricky.
+           // However, useState initialization handles the FIRST render. 
+           // This useEffect handles subsequent updates if props change (unlikely for URL params without navigation)
+           // But let's be safe. If we are forced new, we ensure we have a fresh ID.
+           // actually, the useState init logic is enough for the initial load.
+           // We only need to react if initialSessionId changes.
+      } else if (initialSessionId && initialSessionId !== sessionIdState) {
           setSessionIdState(initialSessionId);
           localStorage.setItem('analysis_session_id', initialSessionId);
       }
-  }, [initialSessionId]);
+  }, [initialSessionId, isNewSession]);
 
   const startNewChat = () => {
      const newId = generateUUID();
