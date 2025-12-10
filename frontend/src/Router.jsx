@@ -22,10 +22,15 @@ function LandingPageWrapper() {
 function DashboardWrapper() {
   const navigate = useNavigate();
 
-  const handleQuestionSelect = (question) => {
-    if (question) {
-      navigate(`/analysis?q=${encodeURIComponent(question)}`);
+  const handleQuestionSelect = (item) => {
+    if (item && typeof item === 'object' && item.id) {
+       // It's a session object
+       navigate(`/analysis?sessionId=${item.id}`);
+    } else if (item && typeof item === 'string') {
+       // It's a query string
+       navigate(`/analysis?q=${encodeURIComponent(item)}`);
     } else {
+       // New analysis
       navigate("/analysis");
     }
   };
@@ -37,6 +42,7 @@ function AnalysisWrapper() {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   const selectedQuestion = searchParams.get("q") || "";
+  const sessionId = searchParams.get("sessionId") || null;
 
   const handleBackToDashboard = () => {
     navigate("/dashboard");
@@ -45,6 +51,7 @@ function AnalysisWrapper() {
   return (
     <AnalysisPage
       selectedQuestion={selectedQuestion}
+      initialSessionId={sessionId}
       onBackToDashboard={handleBackToDashboard}
     />
   );

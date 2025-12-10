@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   BarChart3,
@@ -11,34 +11,75 @@ import {
   Filter,
   ArrowRight,
   Activity,
+  MessageSquare,
+  Calendar,
 } from 'lucide-react';
 import PropTypes from 'prop-types';
 import { Navigation } from '../layout';
-import { QuestionCard } from '../features';
 import { Button, Card } from '../common';
-import questionsData from '../../data/questions.json';
+import { getChatSessions } from '../../services/api';
 
 export const DashboardPage = ({ onQuestionSelect }) => {
-  const [selectedCategory, setSelectedCategory] = useState('All');
   const [searchTerm, setSearchTerm] = useState('');
-
-  const categories = ['All', ...new Set(questionsData.map((q) => q.category))];
-
-  const filteredQuestions = questionsData.filter((question) => {
-    const matchesCategory =
-      selectedCategory === 'All' || question.category === selectedCategory;
-    const matchesSearch =
-      question.question.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      question.description.toLowerCase().includes(searchTerm.toLowerCase());
-    return matchesCategory && matchesSearch;
+  const [sessions, setSessions] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [stats, setStats] = useState({
+    totalSessions: 0,
+    successRate: 100,
+    activeUsers: 1,
+    recentActivity: 0,
   });
 
-  const stats = [
-    { icon: BarChart3, title: 'Total Queries', value: '1,234', change: 12.5 },
-    { icon: TrendingUp, title: 'Success Rate', value: '98.7%', change: 3.2 },
-    { icon: Users, title: 'Active Users', value: '456', change: -2.1 },
-    { icon: Package, title: 'Data Sources', value: '89', change: 15.8 },
+  useEffect(() => {
+    fetchDashboardData();
+  }, []);
+
+  const fetchDashboardData = async () => {
+    try {
+      setLoading(true);
+      const sessionsData = await getChatSessions();
+      setSessions(sessionsData);
+      
+      // Calculate stats based on sessions
+      setStats({
+        totalSessions: sessionsData.length,
+        successRate: 100, // Placeholder
+        activeUsers: 1,
+        recentActivity: sessionsData.filter(s => {
+           const date = new Date(s.created_at);
+           const now = new Date();
+           // Check if within last 24 hours
+           return (now - date) < 24 * 60 * 60 * 1000;
+        }).length,
+      });
+    } catch (error) {
+      console.error('Failed to fetch dashboard data:', error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const filteredSessions = sessions.filter((session) => {
+    const searchLower = searchTerm.toLowerCase();
+    return (
+      (session.title && session.title.toLowerCase().includes(searchLower))
+    );
+  });
+
+  const statCards = [
+    { icon: MessageSquare, title: 'Total Sessions', value: stats.totalSessions.toString(), change: 0 },
+    { icon: TrendingUp, title: 'Success Rate', value: `${stats.successRate}%`, change: 0 },
+    { icon: Users, title: 'Active Users', value: stats.activeUsers.toString(), change: 0 },
+    { icon: Activity, title: 'Recent Activity', value: stats.recentActivity.toString(), change: 0 },
   ];
+
+  const formatDate = (dateString) => {
+    return new Date(dateString).toLocaleDateString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+    });
+  };
 
   return (
     <div className="flex h-screen bg-black overflow-hidden">
@@ -80,7 +121,7 @@ export const DashboardPage = ({ onQuestionSelect }) => {
           <p className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">
             Quick Stats
           </p>
-          {stats.map((stat, index) => (
+          {statCards.map((stat, index) => (
             <motion.div
               key={index}
               initial={{ opacity: 0, x: -20 }}
@@ -95,8 +136,8 @@ export const DashboardPage = ({ onQuestionSelect }) => {
                     stat.change >= 0 ? 'text-blue-500' : 'text-red-400'
                   }`}
                 >
-                  {stat.change >= 0 ? '+' : ''}
-                  {stat.change}%
+                  {stat.change > 0 ? '+' : ''}
+                  {stat.change !== 0 ? `${stat.change}%` : '-'}
                 </span>
               </div>
               <p className="text-xs text-gray-400">{stat.title}</p>
@@ -148,7 +189,7 @@ export const DashboardPage = ({ onQuestionSelect }) => {
           <Card className="p-6 space-y-4">
             <div className="flex items-center space-x-2 mb-4">
               <Search className="w-5 h-5 text-blue-500" />
-              <h2 className="text-lg font-semibold text-white">Explore Questions</h2>
+              <h2 className="text-lg font-semibold text-white">Search History</h2>
             </div>
 
             <div className="flex flex-col md:flex-row gap-4">
@@ -156,27 +197,11 @@ export const DashboardPage = ({ onQuestionSelect }) => {
                 <Search className="absolute left-4 top-1/2 transform -translate-y-1/2 text-gray-500 w-4 h-4" />
                 <input
                   type="text"
-                  placeholder="Search questions..."
+                  placeholder="Search past analyses..."
                   value={searchTerm}
                   onChange={(e) => setSearchTerm(e.target.value)}
                   className="w-full pl-11 pr-4 py-3 bg-gray-950 border border-gray-900 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-blue-600 transition-colors"
                 />
-              </div>
-            </div>
-
-            <div className="flex items-center space-x-2">
-              <Filter className="w-4 h-4 text-gray-400" />
-              <div className="flex gap-2 flex-wrap">
-                {categories.map((category) => (
-                  <Button
-                    key={category}
-                    variant={selectedCategory === category ? 'primary' : 'ghost'}
-                    size="sm"
-                    onClick={() => setSelectedCategory(category)}
-                  >
-                    {category}
-                  </Button>
-                ))}
               </div>
             </div>
           </Card>
@@ -188,24 +213,61 @@ export const DashboardPage = ({ onQuestionSelect }) => {
           >
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-lg font-semibold text-white">
-                Sample Questions ({filteredQuestions.length})
+                Recent Sessions ({filteredSessions.length})
               </h2>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <AnimatePresence>
-                {filteredQuestions.map((question, index) => (
-                  <QuestionCard
-                    key={question.id}
-                    question={question}
-                    onSelect={onQuestionSelect}
-                    index={index}
-                  />
-                ))}
-              </AnimatePresence>
-            </div>
+            {loading ? (
+              <div className="flex justify-center py-12">
+                <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500"></div>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <AnimatePresence>
+                  {filteredSessions.map((session, index) => (
+                    <motion.div
+                      key={session.id}
+                      initial={{ opacity: 0, scale: 0.95 }}
+                      animate={{ opacity: 1, scale: 1 }}
+                      exit={{ opacity: 0, scale: 0.95 }}
+                      transition={{ delay: index * 0.05 }}
+                      onClick={() => onQuestionSelect(session)} 
+                      className="group cursor-pointer"
+                    >
+                      <Card className="p-5 h-full hover:border-blue-500/50 transition-colors">
+                        <div className="flex items-start justify-between mb-3">
+                          <div className="p-2 bg-blue-500/10 rounded-lg group-hover:bg-blue-500/20 transition-colors">
+                            <MessageSquare className="w-5 h-5 text-blue-400" />
+                          </div>
+                          <div className="flex items-center text-xs text-gray-500">
+                            <Calendar className="w-3 h-3 mr-1" />
+                            {formatDate(session.created_at)}
+                          </div>
+                        </div>
+                        
+                        <h3 className="text-base font-semibold text-white mb-2 line-clamp-2 group-hover:text-blue-400 transition-colors">
+                          {session.title || 'Untitled Session'}
+                        </h3>
+                        
+                        <p className="text-sm text-gray-400 line-clamp-2 mb-4">
+                           {/* Session summary or ID if description not available */}
+                           Session ID: {session.id.substring(0, 8)}...
+                        </p>
+                        
+                        <div className="flex items-center justify-between mt-auto pt-4 border-t border-gray-900">
+                          <span className="text-xs text-gray-500">
+                            View Analysis
+                          </span>
+                          <ArrowRight className="w-4 h-4 text-gray-600 group-hover:text-blue-400 transform group-hover:translate-x-1 transition-all" />
+                        </div>
+                      </Card>
+                    </motion.div>
+                  ))}
+                </AnimatePresence>
+              </div>
+            )}
 
-            {filteredQuestions.length === 0 && (
+            {!loading && filteredSessions.length === 0 && (
               <Card className="p-12 text-center">
                 <div className="flex flex-col items-center space-y-4">
                   <div className="p-4 bg-gray-950/50 rounded-full">
@@ -213,12 +275,21 @@ export const DashboardPage = ({ onQuestionSelect }) => {
                   </div>
                   <div>
                     <h3 className="text-xl font-semibold text-gray-400 mb-2">
-                      No questions found
+                      No analyses found
                     </h3>
                     <p className="text-gray-600 text-sm">
-                      Try adjusting your search or filter criteria
+                      {searchTerm ? 'Try adjusting your search terms' : 'Start a new analysis to see it here'}
                     </p>
                   </div>
+                  {!searchTerm && (
+                    <Button
+                      variant="primary"
+                      size="sm"
+                      onClick={() => onQuestionSelect('')}
+                    >
+                      Start Analysis
+                    </Button>
+                  )}
                 </div>
               </Card>
             )}

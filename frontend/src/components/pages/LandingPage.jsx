@@ -3,7 +3,6 @@ import { motion, useMotionValue, useSpring } from 'framer-motion';
 import { Canvas, useFrame } from '@react-three/fiber';
 import { OrbitControls, Sphere, MeshDistortMaterial } from '@react-three/drei';
 import {
-  Brain,
   Activity,
   Shield,
   Rocket,
@@ -516,18 +515,6 @@ const HeroSection = ({ onGetStarted }) => {
               </div>
               <DataVisualization />
             </motion.div>
-
-            <motion.div
-              animate={{ 
-                y: [0, -15, 0],
-                rotateZ: [0, 5, -5, 0],
-              }}
-              transition={{ duration: 4, repeat: Infinity, ease: 'easeInOut' }}
-              className="absolute -top-4 -right-4 bg-gradient-to-r from-blue-500 to-purple-500 text-white p-4 rounded-xl shadow-2xl"
-              style={{ transformStyle: 'preserve-3d', transform: 'translateZ(30px)' }}
-            >
-              <Brain className="w-8 h-8" />
-            </motion.div>
           </motion.div>
         </div>
       </div>
@@ -539,13 +526,7 @@ const FeatureSection = () => {
   const [hoveredIndex, setHoveredIndex] = useState(null);
   
   const features = [
-    {
-      icon: Brain,
-      title: 'AI-Powered Analysis',
-      description:
-        'Advanced machine learning algorithms that understand your data and provide intelligent insights automatically.',
-      color: 'from-blue-500 to-blue-600',
-    },
+   
     {
       icon: Activity,
       title: 'Real-time Processing',

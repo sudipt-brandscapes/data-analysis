@@ -3,15 +3,18 @@ import { API_CONFIG } from '../constants/config';
 
 const api = axios.create({
   baseURL: API_CONFIG.BASE_URL,
-  timeout: 120000, // 120 seconds (2 minutes) - in milliseconds
+  timeout: 60000, // 60 seconds (1 minute) - in milliseconds
   headers: {
     'Content-Type': 'application/json',
   },
 });
 
-export const uploadFile = async (file, onProgress) => {
+export const uploadFile = async (file, sessionId, onProgress) => {
   const formData = new FormData();
   formData.append('file', file);
+  if (sessionId) {
+    formData.append('session_id', sessionId);
+  }
 
   try {
     const response = await api.post('/api/analysis/', formData, {
@@ -34,10 +37,11 @@ export const uploadFile = async (file, onProgress) => {
   }
 };
 
-export const executeAnalysis = async (query) => {
+export const executeAnalysis = async (query, sessionId) => {
   try {
     const response = await api.post('/api/analysis/', {
       query: query,
+      session_id: sessionId,
     });
     return response.data;
   } catch (error) {
@@ -82,6 +86,51 @@ export const saveResults = async (results) => {
     return { success: true };
   } catch (error) {
     console.error('Save error:', error);
+    throw error;
+  }
+};
+
+// Chat History API calls
+export const getChatHistory = async (sessionId) => {
+  try {
+    const config = {};
+    if (sessionId) {
+        config.params = { session_id: sessionId };
+    }
+    const response = await api.get('/api/chat-history/', config);
+    return response.data.history;
+  } catch (error) {
+    console.error('Get chat history error:', error);
+    throw error;
+  }
+};
+
+export const getChatSessions = async () => {
+    try {
+        const response = await api.get('/api/chat-sessions/');
+        return response.data;
+    } catch (error) {
+        console.error('Get chat sessions error:', error);
+        throw error;
+    }
+};
+
+export const getChatHistoryDetail = async (chatId) => {
+  try {
+    const response = await api.get(`/api/chat-history/${chatId}/`);
+    return response.data;
+  } catch (error) {
+    console.error('Get chat history detail error:', error);
+    throw error;
+  }
+};
+
+export const deleteChatHistory = async (sessionId) => {
+  try {
+    const response = await api.delete(`/api/chat-sessions/${sessionId}/`);
+    return response.data;
+  } catch (error) {
+    console.error('Delete chat history error:', error);
     throw error;
   }
 };
