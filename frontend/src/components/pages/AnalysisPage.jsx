@@ -60,6 +60,9 @@ export const AnalysisPage = ({ selectedQuestion = '', urlSessionId = null, onBac
 
   useEffect(() => {
     const loadHistory = async () => {
+        // If loading (analyzing), don't overwrite optimistic UI with empty history
+        if (loading) return;
+
         if (!sessionIdState) {
             setChatItems([]);
             return;

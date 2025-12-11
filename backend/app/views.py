@@ -397,6 +397,18 @@ Return ONLY the fixed query:"""
                 self.message_history.add_user_message(user_input)
                 self.message_history.add_ai_message(clarifying_question)
 
+                # Save to ChatHistory
+                try:
+                    ChatHistory.objects.create(
+                        session_id=self.session_id,
+                        query=user_input,
+                        response=clarifying_question,
+                        sql_query="",
+                        results_count=0,
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to save stream history (clarify): {e}")
+
                 # Stream the clarification as answer
                 yield {"type": "token", "content": clarifying_question}
                 yield {
@@ -425,6 +437,19 @@ Return ONLY the fixed query:"""
                     # Treat as clarification
                     self.message_history.add_user_message(user_input)
                     self.message_history.add_ai_message(response_text)
+
+                    # Save to ChatHistory
+                    try:
+                        ChatHistory.objects.create(
+                            session_id=self.session_id,
+                            query=user_input,
+                            response=response_text,
+                            sql_query="",
+                            results_count=0,
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to save stream history (no-sql): {e}")
+
                     yield {"type": "token", "content": response_text}
                     yield {
                         "type": "complete",
@@ -444,6 +469,19 @@ Return ONLY the fixed query:"""
                 )
                 self.message_history.add_user_message(user_input)
                 self.message_history.add_ai_message(error_msg)
+
+                # Save to ChatHistory
+                try:
+                    ChatHistory.objects.create(
+                        session_id=self.session_id,
+                        query=user_input,
+                        response=error_msg,
+                        sql_query=sql_query,
+                        results_count=0,
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to save stream history (security): {e}")
+
                 yield {"type": "token", "content": error_msg}
                 yield {"type": "error", "error": error_msg}
                 return
@@ -466,6 +504,19 @@ Return ONLY the fixed query:"""
                 error_msg = "Query execution failed. Could you rephrase your question?"
                 self.message_history.add_user_message(user_input)
                 self.message_history.add_ai_message(error_msg)
+
+                # Save to ChatHistory
+                try:
+                    ChatHistory.objects.create(
+                        session_id=self.session_id,
+                        query=user_input,
+                        response=error_msg,
+                        sql_query=sql_query,
+                        results_count=0,
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to save stream history (exec-fail): {e}")
+
                 yield {"type": "token", "content": error_msg}
                 yield {"type": "error", "error": error_msg}
                 return
@@ -492,6 +543,19 @@ Return ONLY the fixed query:"""
             results_dict = (
                 sanitized_results.to_dict(orient="records") if not results.empty else []
             )
+
+            # Save to Django ChatHistory (Critical for History Persistence)
+            try:
+                ChatHistory.objects.create(
+                    session_id=self.session_id,
+                    query=user_input,
+                    response=full_explanation,
+                    sql_query=sql_query,
+                    results_count=len(results_dict),
+                )
+            except Exception as e:
+                logger.error(f"Failed to save stream history: {e}")
+                # Don't fail the stream, just log
 
             yield {
                 "type": "complete",
@@ -1099,9 +1163,9 @@ def clean_column_names(headers):
 
     for header in headers:
         if pd.isna(header) or str(header).strip() == "":
-            header = "Unnamed_Column"
+            header = "unnamed_column"
         else:
-            header = str(header).strip()
+            header = str(header).strip().lower()
             header = re.sub(r"[^\w\s]", "_", header)
             header = re.sub(r"\s+", "_", header)
 
@@ -1435,9 +1499,12 @@ class DataAnalysisAPIView(APIView):
                     ):
                         yield f"data: {json.dumps(event)}\n\n"
 
-                return StreamingHttpResponse(
+                response = StreamingHttpResponse(
                     event_stream(), content_type="text/event-stream"
                 )
+                response["Cache-Control"] = "no-cache"
+                response["X-Accel-Buffering"] = "no"
+                return response
 
             # Normal execution
             try:
